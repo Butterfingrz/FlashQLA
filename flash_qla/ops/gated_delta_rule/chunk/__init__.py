@@ -177,7 +177,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             dh0,
             None,
             None,
-            None,
         )
 
 
