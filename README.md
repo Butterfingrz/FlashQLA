@@ -6,7 +6,7 @@
 
 ## Introduction
 
-FlashQLA is a high-performance linear attention kernel library built on [TileLang](https://github.com/tile-ai/tilelang). FlashQLA applies **reasonable operator fusion and performance optimization** to the forward and backward passes of GDN Chunked Prefill, achieving **2-3× forward speedup** and **2× backward speedup** over the FLA Triton kernel across multiple scenarios on NVIDIA Hopper. The efficiency gains are particularly pronounced in pretraining scenarios and edge-side agentic inference.
+FlashQLA is a high-performance linear attention kernel library built on [TileLang](https://github.com/tile-ai/tilelang). FlashQLA applies **reasonable operator fusion and performance optimization** to the forward and backward passes of GDN Chunked Prefill, achieving **2-3× forward speedup** and **2× backward speedup** over the FLA Triton kernel across multiple scenarios on NVIDIA Hopper and Blackwell. The efficiency gains are particularly pronounced in pretraining scenarios and edge-side agentic inference.
 
 Key features:
 
@@ -18,7 +18,7 @@ Key features:
 
 ## Requirements
 
-- SM90 or above
+- SM90 or SM100
 - CUDA 12.8 or above
 - PyTorch 2.8 or above
 
@@ -72,14 +72,17 @@ dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
 ## Tests
 
 ```bash
+python -m pytest tests/test_gdr_unit.py -v
+```
+
+## Profiling
+
+```bash
 # require flash linear attention for comparison
 pip install flash_linear_attention==0.5.0
 
-cd tests
-python test_gdr.py --set develop
-python test_gdr.py --set varlen --num-heads 32
-python test_gdr.py --set profile --num-heads 32
-python test_gdr.py --set product --ref-dtype float32 --num-heads 32
+python profile/profile_gdr.py --set develop
+python profile/profile_gdr.py --set develop --skip-bwd
 ```
 
 ## Benchmark
@@ -92,14 +95,13 @@ We benchmarked FlashQLA against the FLA Triton and FlashInfer baseline (FLA 0.5.
 
 Specifically, the forward (FWD) benchmarks measure single-kernel latency for different models and TP settings under varying batch lengths, while the backward (BWD) benchmarks examine the relationship between total token count within a batch and latency during a single update step.
 
-More detail in [benchmark_results_H200.txt](./benchmark/benchmark_results_H200.txt).
+More detail in [benchmark_results_H200.txt](./benchmark/benchmark_results_H200.txt) and [benchmark_results_GB200.txt](./benchmark/benchmark_results_GB200.txt).
 
 ```bash
 # require flash linear attention and flashinfer for comparison
-pip install flash_linear_attention==0.5.0 flashinfer-python==0.6.9
+pip install flash_linear_attention==0.5.0 flashinfer-python==0.6.13
 
-cd benchmark
-python bench_gated_delta_rule.py
+python benchmark/bench_gated_delta_rule.py
 ```
 
 ## Acknowledge

@@ -17,14 +17,14 @@ if not rev:
 
 setup(
     name="flash_qla",
-    version="0.1.0" + rev,
+    version="0.1.1" + rev,
     description="FlashQLA: Fused TileLang kernels for Linear Attention",
     packages=find_packages(),
     license="MIT",
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.8",
-        "tilelang==0.1.8",
+        "tilelang==0.1.9",
         "apache-tvm-ffi==0.1.9",
     ],
     zip_safe=False,
