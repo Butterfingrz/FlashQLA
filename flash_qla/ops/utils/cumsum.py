@@ -99,6 +99,12 @@ def tilelang_chunk_local_cumsum(
                     g_cumsum,
                 )
 
+                left = seq_start_idx + chunk_idx * block_S
+                if batch_idx == real_batch_size - 1:
+                    for j, i in T.Parallel(block_S, H):
+                        if left + j >= seq_end_idx and left + j < num_tokens:
+                            g_cumsum[bb, left + j, i] = 0
+
     else:
 
         @T.prim_func

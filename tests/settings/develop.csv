@@ -1,2 +1,0 @@
-batch_size,num_tokens,varlen
-1,32768,False

@@ -12,6 +12,41 @@ from flash_qla.utils import (
 )
 
 
+def torch_l2norm_fwd(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    dim: int = -1,
+):
+    raw_shape = x.shape
+    x = x.view(-1, raw_shape[-1])
+    sum_sq = (x * x).sum(dim=dim, keepdim=True) + eps
+    rstd = torch.rsqrt(sum_sq)
+    y = (x * rstd).to(x.dtype)
+    y = y.view(raw_shape)
+    rstd = rstd.view(*raw_shape[:-1])
+    return y, rstd
+
+
+def torch_l2norm_bwd(
+    y: torch.Tensor,
+    rstd: torch.Tensor,
+    dy: torch.Tensor,
+    eps: float = 1e-6,
+    dim: int = -1,
+):
+    assert dim == -1 or dim == len(dy.shape) - 1
+    assert y.stride(-1) == 1
+    assert dy.stride(-1) == 1
+    raw_shape = dy.shape
+    y = y.view(-1, raw_shape[-1])
+    dy = dy.view(-1, raw_shape[-1])
+    rstd = rstd.view(-1, 1)
+    dot = (dy * y).sum(dim=-1, keepdim=True)
+    dx = dy * rstd - dot * y * rstd
+    dx = dx.view(raw_shape)
+    return dx
+
+
 def torch_cumsum(
     x: torch.Tensor,  # [B, T, H]
     cu_seqlens: torch.Tensor = None,
@@ -21,7 +56,7 @@ def torch_cumsum(
     if cu_seqlens is not None:
         x = unpack(x, cu_seqlens)
 
-    batch_size, num_tokens, num_heads = x.shape
+    raw_shape = x.shape
 
     x = pad_and_reshape(x, dim=1, chunk_size=chunk_size)
 
@@ -31,8 +66,8 @@ def torch_cumsum(
         x = torch.flip(x, dims=(2,))
     else:
         x = x.cumsum(dim=2)
-    x = x.reshape(batch_size, -1, num_heads)
-    x = x[:, :num_tokens]
+    x = x.reshape(raw_shape[0], -1, *raw_shape[2:])
+    x = x[:, :raw_shape[1]]
 
     if cu_seqlens is not None:
         x = pack(x, cu_seqlens)
@@ -657,6 +692,7 @@ def chunk_gated_delta_rule_bwd(
         do=do,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
     )
     dh, dh0, dv = torch_chunk_gdr_bwd(
         q=q,
@@ -669,6 +705,7 @@ def chunk_gated_delta_rule_bwd(
         dv=dv,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
     )
     dq, dk1, dw, dg1 = torch_chunk_dqkwg_bwd(
         q=q,
@@ -682,6 +719,7 @@ def chunk_gated_delta_rule_bwd(
         dh=dh,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
     )
     dk, dv, db, dg = torch_chunk_wy_bwd(
         k=k,
@@ -702,3 +740,110 @@ def chunk_gated_delta_rule_bwd(
         dk = torch.sum(dk.reshape(B, T, Hg, -1, K), dim=3)
     dg = torch_cumsum(dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens)
     return dq, dk, dv, db, dg, dh0
+
+
+class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
+
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        scale: float | None = None,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        cu_seqlens: torch.LongTensor | None = None,
+        use_qk_l2norm_in_kernel: bool = False,
+    ):
+        q_rstd, k_rstd = None, None
+        if use_qk_l2norm_in_kernel:
+            q, q_rstd = torch_l2norm_fwd(q)
+            k, k_rstd = torch_l2norm_fwd(k)
+
+        g, o, A, _, final_state = chunk_gated_delta_rule_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+        )
+
+        ctx.save_for_backward(q, k, q_rstd, k_rstd, v, g, beta, A, initial_state, cu_seqlens)
+        ctx.scale = scale
+        ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+        return o.to(q.dtype), final_state
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx, do: torch.Tensor, dht: torch.Tensor):
+        q, k, q_rstd, k_rstd, v, g, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
+
+        dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A=A,
+            do=do,
+            dht=dht,
+            scale=ctx.scale,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+        )
+
+        if ctx.use_qk_l2norm_in_kernel:
+            dq = torch_l2norm_bwd(q, q_rstd, dq)
+            dk = torch_l2norm_bwd(k, k_rstd, dk)
+
+        return (
+            dq.to(q),
+            dk.to(k),
+            dv.to(v),
+            dg.to(g),
+            db.to(beta),
+            None,
+            dh0,
+            None,
+            None,
+            None,
+        )
+
+
+@torch.compiler.disable
+def chunk_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float = None,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+):
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    o, final_state = ChunkGatedDeltaRuleFunction.apply(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        use_qk_l2norm_in_kernel,
+    )
+
+    return o, final_state
