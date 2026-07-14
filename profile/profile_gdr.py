@@ -465,7 +465,7 @@ if __name__ == "__main__":
     }
 
     preset = pd.read_csv(
-        os.path.join(PROJECT_ROOT, "utils", "settings", f"{args.set}.csv")
+        os.path.join(PROJECT_ROOT, "profile", "settings", f"{args.set}.csv")
     )
     for i, row in preset.iterrows():
         print("-" * 64)

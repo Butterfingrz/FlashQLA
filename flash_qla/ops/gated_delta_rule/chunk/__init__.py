@@ -26,6 +26,7 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
 else:
     raise ValueError("FlashQLA now support sm90 and sm100 only.")
 from .cp_context import intra_card_cp_preprocess, intra_card_cp_preprocess_bwd, _calc_cp_seqs, _create_cu_seqlens
+from .cp import CPChunkGatedDeltaRuleFunction  # 单层 inter-card CP（当前主线，独立 autograd 路径）
 
 from flash_qla.utils import input_guard
 
@@ -282,6 +283,7 @@ def chunk_gated_delta_rule(
     state_v_first: bool = False,
     auto_cp: bool = True,
     enable_fwd_cp_cache: bool = True,
+    cp_context=None,
 ):
     r"""
     Args:
@@ -369,6 +371,21 @@ def chunk_gated_delta_rule(
     assert v.shape[2] % k.shape[2] == 0, (
         "num_qk_heads must be divisible to num_v_heads."
     )
+
+    # 单层 inter-card CP（当前主线）：独立 autograd 路径，与 intra/非 CP 完全分离
+    if cp_context is not None and cp_context.is_cp_enabled:
+        if q.shape[0] != 1:
+            raise ValueError("inter-card CP requires B==1 (varlen).")
+        if initial_state is not None:
+            raise ValueError("inter-card CP does not support user `initial_state`.")
+        if output_final_state:
+            raise ValueError("inter-card CP does not support `output_final_state=True`.")
+        if scale is None:
+            scale = k.shape[-1] ** -0.5
+        o = CPChunkGatedDeltaRuleFunction.apply(
+            q, k, v, g, beta, scale, state_v_first, use_qk_l2norm_in_kernel, cp_context,
+        )
+        return o, None
 
     if cu_seqlens is not None:
         if q.shape[0] != 1:

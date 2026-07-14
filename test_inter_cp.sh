@@ -1,0 +1,1 @@
+torchrun --nproc_per_node=2 --master_port=29500 cp_2gpu_test.py
