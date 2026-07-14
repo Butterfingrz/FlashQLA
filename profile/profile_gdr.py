@@ -333,6 +333,22 @@ def profile_gated_delta_rule(
             "[bwd] cp-c": nan,
             "[bwd] cp-dh": nan,
         }
+        # torch ops that FLA launches between fused kernels
+        fla_misc = 0.0
+        for k_name, v_time in prof_fla.items():
+            if k_name == "total":
+                continue
+            if k_name not in result_fla.values() and not any(
+                k_name.startswith(n) for n in [
+                    "chunk_local_cumsum", "chunk_gated_delta_rule_fwd",
+                    "chunk_gated_delta_rule_bwd", "chunk_bwd_kernel",
+                    "kernel_kernel", "prepare_wy_repr", "recompute_w_u",
+                    "compress_heads",
+                ]
+            ):
+                fla_misc += v_time if not math.isnan(v_time) else 0.0
+        if fla_misc > 0:
+            result_fla["[bwd] misc"] = fla_misc
         if num_k_heads < num_v_heads:
             result_fla["[bwd] reduc"] = _get(prof_fla, "compress_heads_kernel")
         result_fla["total"] = prof_fla["total"]

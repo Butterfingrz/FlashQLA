@@ -25,7 +25,9 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
     CHUNK_SIZE = 32
 else:
     raise ValueError(f"FlashQLA now support sm90, sm100, sm103 and sm120 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
-from .cp_context import intra_card_cp_preprocess, intra_card_cp_preprocess_bwd, _calc_cp_seqs, _create_cu_seqlens
+from .cp import (
+    build_intra_cp_context, cp_preprocess_fwd, cp_preprocess_bwd, finalize_dh0, FlashQLACPContext,
+)
 
 from flash_qla.utils import input_guard
 
@@ -44,30 +46,30 @@ def chunk_gated_delta_rule_fwd(
     auto_cp: bool = True,
     state_v_first: bool = False,
     enable_fwd_cp_cache: bool = False,
+    cp_context: FlashQLACPContext | None = None,
 ):
+    # Since intra + inter is not supported, intra CP is only enabled when inter CP is not enabled. 
+    if cp_context is None:
+        cp_context = build_intra_cp_context(
+            cp_context, k, v, CHUNK_SIZE, cu_seqlens, auto_cp=auto_cp, is_bwd=False)
+
     g = chunk_local_cumsum(
         g=g,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=cp_context.cu_seqlens,
         chunk_size=CHUNK_SIZE,
     )
     A = kkt_solve(
         k=k,
         b=beta,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=cp_context.cu_seqlens,
         chunk_size=CHUNK_SIZE,
     )
-    cp_cache = None
-    if auto_cp:
-        initial_state, cu_seqlens, cp_seq_map, raw_cu_seqlens, cp_cache = intra_card_cp_preprocess(
-            k=k, v=v, a=A, g=g, b=beta,
-            raw_h0=initial_state,
-            raw_cu_seqlens=cu_seqlens,
-            state_v_first=state_v_first,
-            enable_fwd_cp_cache=enable_fwd_cp_cache,
-        )
-    else:
-        cp_seq_map = None
-        raw_cu_seqlens = None
+    initial_state, cp_cache = cp_preprocess_fwd(
+        cp_context, k=k, v=v, a=A, g=g, beta=beta,
+        initial_state=initial_state,
+        state_v_first=state_v_first,
+        enable_fwd_cp_cache=enable_fwd_cp_cache,
+    )
     o, h, final_state = fused_gdr_fwd(
         q=q,
         k=k,
@@ -80,9 +82,9 @@ def chunk_gated_delta_rule_fwd(
         output_final_state=output_final_state,
         output_h=output_h,
         output_o=True,
-        cu_seqlens=cu_seqlens,
-        cp_seq_map=cp_seq_map,
-        raw_cu_seqlens=raw_cu_seqlens,
+        cu_seqlens=cp_context.intra_cp_cu_seqlens if cp_context.is_intra_cp_enabled else cp_context.cu_seqlens,
+        cp_seq_map=cp_context.seq_map_c2r,
+        raw_cu_seqlens=cp_context.cu_seqlens,
         state_v_first=state_v_first,
     )
     return g, A, o, h, final_state, cp_cache
@@ -102,7 +104,8 @@ def chunk_gated_delta_rule_bwd(
     cu_seqlens: torch.LongTensor | None = None,
     state_v_first: bool = False,
     auto_cp: bool = True,
-    cp_cache: tuple | None = None,
+    cp_cache=None,
+    cp_context=None,
 ):
     if fused_gdr_bwd is None:
         raise NotImplementedError(
@@ -110,52 +113,42 @@ def chunk_gated_delta_rule_bwd(
             "Only forward pass is supported on this architecture."
         )
 
-    batch_size, num_tokens, num_k_heads, _ = k.shape
-    _, _, H, _ = v.shape
     chunk_size = A.shape[-1]
 
-    if auto_cp and fused_gdr_dh is not None:
-        h0, cu_seqlens_fwd, dht, cu_seqlens_bwd, seq_map_r2c, use_cp = intra_card_cp_preprocess_bwd(
-            k=k, v=v, a=A, g=g, b=beta, raw_h0=initial_state,
-            q=q, do=do, dht=dht, scale=scale,
-            raw_cu_seqlens=cu_seqlens,
-            state_v_first=state_v_first,
-            cp_cache=cp_cache,
-        )
-    else:
-        h0 = initial_state
-        cu_seqlens_fwd = cu_seqlens
-        dht = dht
-        cu_seqlens_bwd = cu_seqlens
-        seq_map_r2c = None
-        use_cp = False
+    if cp_context is None:
+        cp_context = build_intra_cp_context(
+            cp_context, k, v, chunk_size, cu_seqlens, auto_cp=auto_cp, is_bwd=True)
+
+    h0, dht = cp_preprocess_bwd(
+        cp_context, q=q, k=k, v=v, a=A, g=g, beta=beta, do=do, dht=dht, scale=scale,
+        initial_state=initial_state,
+        state_v_first=state_v_first,
+        cp_cache=cp_cache,
+    )
 
     h, _, _ = fused_gdr_h(
         k=k, v=v, a=A, g=g, b=beta,
         initial_state=h0,
         output_final_state=False,
         output_h=True,
-        cu_seqlens=cu_seqlens_fwd,
+        cu_seqlens=cp_context.intra_cp_cu_seqlens if cp_context.is_intra_cp_enabled else cp_context.cu_seqlens,
         state_v_first=state_v_first,
     )
     dq, dk, dv, dg, db, dh0 = fused_gdr_bwd(
         q=q, k=k, v=v, a=A, g=g, b=beta,
         do=do, dht=dht, h=h, scale=scale,
-        cu_seqlens=cu_seqlens_bwd,
+        cu_seqlens=cp_context.intra_cp_cu_seqlens if cp_context.is_intra_cp_enabled else cp_context.cu_seqlens,
         state_v_first=state_v_first,
     )
 
-    if use_cp:  # TODO store dh0 in fused_bwd kernel
-        dh0 = dh0[seq_map_r2c[:-1].long()] if dh0 is not None else None
-    elif initial_state is None:
-        dh0 = None
+    dh0 = finalize_dh0(dh0, cp_context, initial_state is not None)
 
     Hg, H = k.shape[-2], v.shape[-2]
     if Hg < H:
         dq = group_reduce_vector(dq, Hg)
         dk = group_reduce_vector(dk, Hg)
     assert dg.dtype == torch.float32, "dg should be fp32"
-    dg = chunk_local_cumsum(dg, chunk_size=chunk_size, reverse=True, cu_seqlens=cu_seqlens)
+    dg = chunk_local_cumsum(dg, chunk_size=chunk_size, reverse=True, cu_seqlens=cp_context.cu_seqlens)
     return dq, dk, dv, db, dg, dh0
 
 
@@ -178,6 +171,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         state_v_first: bool = False,
         auto_cp: bool = True,
         enable_fwd_cp_cache: bool = True,
+        cp_context=None,
     ):
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
@@ -198,35 +192,23 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             state_v_first=state_v_first,
             auto_cp=auto_cp,
             enable_fwd_cp_cache=enable_fwd_cp_cache,
+            cp_context=cp_context,
         )
 
-        if cp_cache is not None:
-            cached_cp_h0, cached_mt, cached_fallback_bwd, cached_num_warmup_bwd = cp_cache
-            ctx.save_for_backward(
-                q, k, q_rstd, k_rstd, v, g, beta, A, initial_state, cu_seqlens,
-                cached_cp_h0, cached_mt, cached_fallback_bwd, cached_num_warmup_bwd,
-            )
-            ctx._cp_cache_count = 4
-        else:
-            ctx.save_for_backward(q, k, q_rstd, k_rstd, v, g, beta, A, initial_state, cu_seqlens)
-            ctx._cp_cache_count = 0
+        ctx.save_for_backward(q, k, q_rstd, k_rstd, v, g, beta, A, initial_state, cu_seqlens)
         ctx.scale = scale
         ctx.state_v_first = state_v_first
         ctx.autocp = auto_cp
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+        ctx.cp_context = cp_context
+        ctx.cp_cache = cp_cache
         return o.to(q.dtype), final_state
 
     @staticmethod
     @input_guard
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, do: torch.Tensor, dht: torch.Tensor):
-        if ctx._cp_cache_count == 4:
-            q, k, q_rstd, k_rstd, v, g, beta, A, initial_state, cu_seqlens, \
-                cached_cp_h0, cached_mt, cached_fallback_bwd, cached_num_warmup_bwd = ctx.saved_tensors
-            cp_cache = (cached_cp_h0, cached_mt, cached_fallback_bwd, cached_num_warmup_bwd)
-        else:
-            q, k, q_rstd, k_rstd, v, g, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
-            cp_cache = None
+        q, k, q_rstd, k_rstd, v, g, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
 
         dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
             q=q,
@@ -242,7 +224,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             state_v_first=ctx.state_v_first,
             auto_cp=ctx.autocp,
-            cp_cache=cp_cache,
+            cp_cache=ctx.cp_cache,
+            cp_context=ctx.cp_context,
         )
 
         if ctx.use_qk_l2norm_in_kernel:
@@ -255,14 +238,15 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             dv.to(v),
             dg.to(g),
             db.to(beta),
-            None,
-            dh0 if initial_state is not None else None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,          # scale
+            dh0,           # initial_state
+            None,          # output_final_state
+            None,          # cu_seqlens
+            None,          # state_v_first
+            None,          # auto_cp
+            None,          # use_qk_l2norm_in_kernel
+            None,          # enable_fwd_cp_cache
+            None,          # cp_context
         )
 
 
@@ -282,6 +266,7 @@ def chunk_gated_delta_rule(
     state_v_first: bool = False,
     auto_cp: bool = True,
     enable_fwd_cp_cache: bool = True,
+    cp_context=None,
 ):
     r"""
     Args:
@@ -370,7 +355,11 @@ def chunk_gated_delta_rule(
         "num_qk_heads must be divisible to num_v_heads."
     )
 
-    if cu_seqlens is not None:
+    is_inter = cp_context is not None and cp_context.is_inter_cp_enabled
+    if is_inter and q.shape[0] != 1:
+        raise ValueError("inter-card CP requires B==1 (varlen).")
+
+    if not is_inter and cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
@@ -399,6 +388,7 @@ def chunk_gated_delta_rule(
         state_v_first,
         auto_cp,
         enable_fwd_cp_cache,
+        cp_context,
     )
 
     return o, final_state
