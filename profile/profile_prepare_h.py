@@ -84,7 +84,7 @@ def main():
 
     def main_fwd():
         return fused_gdr_fwd(q=q, k=k, v=v, a=A, g=g_c, b=beta, scale=scale,
-                             initial_state=None, output_final_state=False,
+                             initial_state=None, output_final_state=True,
                              output_h=False, output_o=True, cu_seqlens=cu,
                              cp_seq_map=None, raw_cu_seqlens=None)
 

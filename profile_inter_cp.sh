@@ -1,1 +1,0 @@
-torchrun --nproc_per_node=2 --master_port=29500 profile/profile_gdr_cp.py --seqlen 32768 --nvh 8 --nkh 2 --cu-seqlens 0-16384-32768

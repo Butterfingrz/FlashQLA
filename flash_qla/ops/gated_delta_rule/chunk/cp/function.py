@@ -33,6 +33,7 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
         scale: float,
         state_v_first: bool,
         use_qk_l2norm_in_kernel: bool,
+        output_final_state: bool,
         cp_context,
     ):
         # 懒导入 chunk/__init__ 的符号，避免循环依赖
@@ -53,11 +54,11 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cp_context=cp_context, state_v_first=state_v_first,
         )
 
-        o, _, _ = fused_gdr_fwd(
+        o, _, final_state = fused_gdr_fwd(
             q=q, k=k, v=v, a=A, g=g, b=beta,
             scale=scale,
             initial_state=raw_h0,
-            output_final_state=False,
+            output_final_state=output_final_state,
             output_h=False,
             output_o=True,
             cu_seqlens=cu,
@@ -72,12 +73,12 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
         ctx.state_v_first = state_v_first
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx.cp_context = cp_context
-        return o.to(q.dtype)
+        return o.to(q.dtype), final_state
 
     @staticmethod
     @input_guard
     @torch.amp.custom_bwd(device_type="cuda")
-    def backward(ctx, do: torch.Tensor):
+    def backward(ctx, do: torch.Tensor, dht: torch.Tensor):
         raise NotImplementedError(
             "inter-card CP backward 尚未实现（当前只支持前向）。"
             "若需梯度，请暂勿在 cp_context 前向后调用 backward。"

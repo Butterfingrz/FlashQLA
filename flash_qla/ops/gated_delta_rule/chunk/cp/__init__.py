@@ -11,6 +11,7 @@ from .scan import reduce_local, inter_scan, seq_reset_from_seq_map
 from .context import FLACPContext, build_cp_context, get_cp_cu_seqlens
 from .comm import all_gather_into_tensor, pack_hm, unpack_hm
 from .preprocess import inter_card_cp_preprocess_fwd
+from .preprocess import inter_card_cp_prepare_hm, inter_card_cp_all_gather_hm, inter_card_cp_correct_initial_states
 from .function import CPChunkGatedDeltaRuleFunction
 
 __all__ = [
@@ -21,5 +22,7 @@ __all__ = [
     # S3 通信 + 打包
     "all_gather_into_tensor", "pack_hm", "unpack_hm",
     # 单层前向 pre_process + autograd Function
-    "inter_card_cp_preprocess_fwd", "CPChunkGatedDeltaRuleFunction",
+    "inter_card_cp_preprocess_fwd",
+    "inter_card_cp_prepare_hm", "inter_card_cp_all_gather_hm", "inter_card_cp_correct_initial_states",
+    "CPChunkGatedDeltaRuleFunction",
 ]
