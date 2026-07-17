@@ -9,6 +9,8 @@
 走 chunk_gated_delta_rule(cp_context=...)；输出与**单卡** auto_cp=False golden 的对应片对齐。
 同时比较 output_final_state：末 rank 最后一个 local 序列的 final state 与 golden 的最后一个
 全局序列的 final state 对齐。
+
+后向验证：各梯度（dq, dk, dv, dg, db）的对应片与单卡 golden 的梯度对齐。
 """
 
 import os
@@ -95,6 +97,81 @@ def run_case(cu_global, Hk, Hv, g_scale, dev, rank, W, seed=SEED):
     return ok
 
 
+def _generate_inputs(T, Hk, Hv, K, V, g_scale, dev, seed):
+    """生成一组输入张量（detached，不 requires_grad）。"""
+    torch.manual_seed(seed)
+    q = F.normalize(torch.randn(1, T, Hk, K, device=dev, dtype=DTYPE), p=2, dim=-1)
+    k = F.normalize(torch.randn(1, T, Hk, K, device=dev, dtype=DTYPE), p=2, dim=-1)
+    v = torch.randn(1, T, Hv, V, device=dev, dtype=DTYPE)
+    beta = torch.randn(1, T, Hv, device=dev, dtype=torch.float32).sigmoid()
+    g = F.logsigmoid(torch.randn(1, T, Hv, device=dev, dtype=torch.float32)) * g_scale
+    return q, k, v, beta, g
+
+
+def run_case_backward(cu_global, Hk, Hv, g_scale, dev, rank, W, seed=SEED):
+    T = cu_global[-1]
+    K = V = 128
+    scale = K ** -0.5
+    cu_g = torch.tensor(cu_global, device=dev, dtype=torch.int32)
+    part = T // W
+    lo, hi = rank * part, (rank + 1) * part
+
+    # ---------- golden: 单卡 backward ----------
+    q_ref, k_ref, v_ref, beta_ref, g_ref = _generate_inputs(T, Hk, Hv, K, V, g_scale, dev, seed)
+    q_ref.requires_grad_(True)
+    k_ref.requires_grad_(True)
+    v_ref.requires_grad_(True)
+    beta_ref.requires_grad_(True)
+    g_ref.requires_grad_(True)
+
+    o_ref, _ = chunk_gated_delta_rule(
+        q_ref, k_ref, v_ref, g_ref, beta_ref, scale=scale,
+        cu_seqlens=cu_g, output_final_state=False, auto_cp=False)
+    o_ref.sum().backward()
+
+    # ---------- CP backward ----------
+    q_cp, k_cp, v_cp, beta_cp, g_cp = _generate_inputs(T, Hk, Hv, K, V, g_scale, dev, seed)
+    q_cp = q_cp[:, lo:hi].clone().requires_grad_(True)
+    k_cp = k_cp[:, lo:hi].clone().requires_grad_(True)
+    v_cp = v_cp[:, lo:hi].clone().requires_grad_(True)
+    beta_cp = beta_cp[:, lo:hi].clone().requires_grad_(True)
+    g_cp = g_cp[:, lo:hi].clone().requires_grad_(True)
+
+    ctx = build_cp_context(cu_g, group=dist.group.WORLD)
+    o_cp, _ = chunk_gated_delta_rule(
+        q_cp, k_cp, v_cp, g_cp, beta_cp,
+        scale=scale, cp_context=ctx, output_final_state=False)
+    o_cp.sum().backward()
+
+    # ---------- 比较各梯度 ----------
+    max_ratio = 0.0
+    worst_name = ""
+    for name, ref_param, cp_param in [
+        ("dq", q_ref, q_cp),
+        ("dk", k_ref, k_cp),
+        ("dv", v_ref, v_cp),
+        ("dg", g_ref, g_cp),
+        ("db", beta_ref, beta_cp),
+    ]:
+        ref_grad = ref_param.grad[:, lo:hi].float()
+        cp_grad = cp_param.grad.float()
+        err = (cp_grad - ref_grad).abs().max().item()
+        ref_norm = ref_grad.abs().max().item()
+        ratio = err / (ref_norm + 1e-30)
+        if ratio > max_ratio:
+            max_ratio = ratio
+            worst_name = name
+
+    t = torch.tensor([max_ratio], device=dev)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    max_ratio_all = t[0].item()
+    ok = max_ratio_all <= RTOL
+    if rank == 0:
+        print(f"[{'PASS' if ok else 'FAIL'}] cu={cu_global} Hk/Hv={Hk}/{Hv} "
+              f"g×{g_scale:<7} grad_ratio={max_ratio_all:.2e}")
+    return ok
+
+
 def main():
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -103,21 +180,47 @@ def main():
     torch.cuda.set_device(local)
     dev = f"cuda:{local}"
 
+    cases = make_cases(W)
+
+    # Forward 测试
     if rank == 0:
         print("=" * 80)
-        print(f"单层 inter-card CP 真 {W} 卡验证（vs 单卡 auto_cp=False golden，rtol={RTOL}）")
+        print(f"单层 inter-card CP 真 {W} 卡 前向 验证（vs 单卡 auto_cp=False golden，rtol={RTOL}）")
         print("=" * 80)
 
-    cases = make_cases(W)
-    results = []
+    fwd_results = []
     for cu_global, Hk, Hv, gs in cases:
-        results.append(run_case(cu_global, Hk, Hv, gs, dev, rank, W))
+        fwd_results.append(run_case(cu_global, Hk, Hv, gs, dev, rank, W))
+
     if rank == 0:
-        n = sum(results)
+        n = sum(fwd_results)
+        print(f"前向：{n}/{len(fwd_results)} 通过")
+
+    # Backward 测试
+    if rank == 0:
+        print("=" * 80)
+        print(f"单层 inter-card CP 真 {W} 卡 后向 验证（vs 单卡 auto_cp=False golden，rtol={RTOL}）")
+        print("=" * 80)
+
+    bwd_results = []
+    for cu_global, Hk, Hv, gs in cases:
+        torch.cuda.empty_cache()
+        bwd_results.append(run_case_backward(cu_global, Hk, Hv, gs, dev, rank, W))
+
+    if rank == 0:
+        n_bwd = sum(bwd_results)
+        print(f"后向：{n_bwd}/{len(bwd_results)} 通过")
+
+    # 总结
+    if rank == 0:
         print("-" * 80)
-        print(f"总计 {n}/{len(results)} 通过")
+        total = sum(fwd_results) + sum(bwd_results)
+        total_cases = len(fwd_results) + len(bwd_results)
+        print(f"总计 {total}/{total_cases} 通过")
+
     dist.destroy_process_group()
-    if rank == 0 and sum(results) != len(results):
+    all_pass = all(fwd_results) and all(bwd_results)
+    if rank == 0 and not all_pass:
         raise SystemExit(1)
 
 

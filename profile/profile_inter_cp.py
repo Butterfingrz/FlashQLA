@@ -1,6 +1,6 @@
 # Copyright (c) 2026 The Qwen team, Alibaba Group.
 # Licensed under The MIT License [see LICENSE for details]
-"""单层 inter-card CP 前向的 kernel profiling。
+"""单层 inter-card CP 前向+后向的 kernel profiling。
 
 每个 baseline 是一个独立函数，内部用 ``with timer.mark('tag')`` 标注各步，
 外层 ``timer.bench()`` 控制 warmup+rep 迭代并对各 tag 求均值。
@@ -31,13 +31,18 @@ sys.path.insert(0, PROJECT_ROOT)
 from cuda_timer import CudaTimer
 from flash_qla import chunk_gated_delta_rule as chunk_gated_delta_rule_qla
 from flash_qla.utils import l2norm
-from flash_qla.ops.utils import chunk_local_cumsum
-from flash_qla.ops.gated_delta_rule.chunk import kkt_solve, fused_gdr_fwd
+from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
+from flash_qla.ops.gated_delta_rule.chunk import (
+    kkt_solve, fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, fused_gdr_dh, CHUNK_SIZE,
+)
 from flash_qla.ops.gated_delta_rule.chunk.cp import (
     build_cp_context,
     inter_card_cp_prepare_hm,
     inter_card_cp_all_gather_hm,
     inter_card_cp_correct_initial_states,
+    inter_card_cp_prepare_dhm,
+    inter_card_cp_all_gather_dhm,
+    inter_card_cp_correct_terminal_states,
 )
 
 CHUNK = 64
@@ -196,6 +201,115 @@ def baseline_fla_cp(timer: CudaTimer, local: dict, cu_g: torch.Tensor, scale: fl
     timer.bench(run_stages, timer)
 
 
+def baseline_fla_cp_bwd(timer: CudaTimer, local: dict, cu_g: torch.Tensor, scale: float):
+    """fla 的 inter-card CP 后向，逐阶段拆解。"""
+    if FLA_LATEST_PATH and FLA_LATEST_PATH not in sys.path:
+        sys.path.insert(0, FLA_LATEST_PATH)
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as chunk_gdn_fla
+    from fla.ops.cp import build_cp_context as build_cp_context_fla
+    from fla.ops.cp.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h_pre_process,
+        chunk_gated_delta_rule_bwd_dhu_pre_process,
+    )
+    from fla.ops.utils import chunk_local_cumsum as cls_fla
+    from fla.ops.utils.constant import RCP_LN2
+    from fla.ops.utils.index import prepare_chunk_indices
+    from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra
+    from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd, prepare_wy_repr_bwd
+    from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h, chunk_gated_delta_rule_bwd_dhu
+    from fla.ops.common.chunk_o import chunk_fwd_o, chunk_bwd_dv_local, chunk_bwd_dqkwg
+
+    ctx_fla = build_cp_context_fla(cu_g, group=dist.group.WORLD)
+    cuf = ctx_fla.cu_seqlens
+
+    # e2e backward
+    def run_e2e(t):
+        q_t = local["q"].clone().requires_grad_(True)
+        k_t = local["k"].clone().requires_grad_(True)
+        v_t = local["v"].clone().requires_grad_(True)
+        g_t = local["g"].clone().requires_grad_(True)
+        b_t = local["beta"].clone().requires_grad_(True)
+        with t.mark("fla_bwd/e2e"):
+            o, _ = chunk_gdn_fla(q_t, k_t, v_t, g_t, b_t, scale=scale, cp_context=ctx_fla)
+            o.sum().backward()
+
+    timer.bench(run_e2e, timer)
+
+    # stage-by-stage backward
+    def run_stages(t):
+        chunk_indices = prepare_chunk_indices(cuf, CHUNK)
+        g_c = cls_fla(local["g"], chunk_size=CHUNK, scale=RCP_LN2,
+                      cu_seqlens=cuf, chunk_indices=chunk_indices)
+        w, u, A = chunk_gated_delta_rule_fwd_intra(
+            k=local["k"], v=local["v"], g=g_c, beta=local["beta"],
+            cu_seqlens=cuf, chunk_indices=chunk_indices, chunk_size=CHUNK,
+        )
+        init_state = chunk_gated_delta_rule_fwd_h_pre_process(
+            k=local["k"], w=w, u=u, g=g_c,
+            cu_seqlens=cuf, initial_state=None,
+            context=ctx_fla, state_v_first=False, chunk_size=CHUNK,
+        )
+        h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+            k=local["k"], w=w, u=u, g=g_c,
+            initial_state=init_state, output_final_state=False,
+            cu_seqlens=cuf, chunk_indices=chunk_indices,
+            state_v_first=False, chunk_size=CHUNK,
+        )
+        o = chunk_fwd_o(
+            q=local["q"], k=local["k"], v=v_new, h=h, g=g_c,
+            scale=scale, cu_seqlens=cuf, chunk_indices=chunk_indices,
+            state_v_first=False, chunk_size=CHUNK,
+        )
+        do = torch.ones_like(o)
+
+        with t.mark("fla_bwd/recompute_wu"):
+            w2, u2 = recompute_w_u_fwd(
+                k=local["k"], v=local["v"], beta=local["beta"], A=A, g=g_c,
+                cu_seqlens=cuf, chunk_indices=chunk_indices,
+            )
+        with t.mark("fla_bwd/recompute_h"):
+            h2, v_new2, _ = chunk_gated_delta_rule_fwd_h(
+                k=local["k"], w=w2, u=u2, g=g_c,
+                initial_state=init_state, output_final_state=False,
+                cu_seqlens=cuf, chunk_indices=chunk_indices,
+                state_v_first=False, chunk_size=CHUNK,
+            )
+        with t.mark("fla_bwd/dv_local"):
+            dv = chunk_bwd_dv_local(
+                q=local["q"], k=local["k"], do=do, g=g_c,
+                scale=scale, cu_seqlens=cuf, chunk_size=CHUNK, chunk_indices=chunk_indices,
+            )
+        with t.mark("fla_bwd/cp_preprocess"):
+            dht, _ = chunk_gated_delta_rule_bwd_dhu_pre_process(
+                q=local["q"], k=local["k"], w=w2, do=do, dv=dv, g=g_c,
+                scale=scale, state_v_first=False, cu_seqlens=cuf,
+                dht=None, initial_state=init_state,
+                context=ctx_fla, chunk_size=CHUNK,
+            )
+        with t.mark("fla_bwd/bwd_dhu"):
+            dh, dh0, dv2 = chunk_gated_delta_rule_bwd_dhu(
+                q=local["q"], k=local["k"], w=w2, do=do, dv=dv, g=g_c,
+                h0=init_state, dht=dht, scale=scale,
+                state_v_first=False, cu_seqlens=cuf, chunk_size=CHUNK,
+                chunk_indices=chunk_indices,
+            )
+        with t.mark("fla_bwd/dqkwg"):
+            dq, dk, dw, dg = chunk_bwd_dqkwg(
+                q=local["q"], k=local["k"], v=v_new2, do=do,
+                h=h2, dh=dh, w=w2, g=g_c, dv=dv2,
+                scale=scale, state_v_first=False, cu_seqlens=cuf,
+                chunk_size=CHUNK, chunk_indices=chunk_indices,
+            )
+        with t.mark("fla_bwd/wy_bwd"):
+            prepare_wy_repr_bwd(
+                k=local["k"], v=local["v"], beta=local["beta"], A=A,
+                dw=dw, du=dv2, g=g_c,
+                cu_seqlens=cuf, chunk_indices=chunk_indices,
+            )
+
+    timer.bench(run_stages, timer)
+
+
 # ---------------------------------------------------------------------------
 # CP forward stages
 # ---------------------------------------------------------------------------
@@ -255,6 +369,108 @@ def cp_fwd_stages(timer: CudaTimer, local: dict, ctx, inputs: dict):
 
 
 # ---------------------------------------------------------------------------
+# CP backward stages
+# ---------------------------------------------------------------------------
+
+def cp_bwd_stages(timer: CudaTimer, local: dict, ctx, inputs: dict):
+    """QLA inter-card CP 后向各阶段拆解。"""
+    if fused_gdr_bwd is None or fused_gdr_dh is None:
+        return
+
+    scale = inputs["scale"]
+    cu = ctx.cu_seqlens
+    Hv = local["v"].shape[2]
+    Hg = local["k"].shape[2]
+    K = local["k"].shape[3]
+    V = local["v"].shape[3]
+    cu_cpu = ctx.cu_seqlens_cpu.tolist()
+    N = len(cu_cpu) - 1
+
+    # 先跑一次 forward 拿到 raw_h0 和 M_r_first
+    g_c = chunk_local_cumsum(local["g"], cu_seqlens=cu, chunk_size=CHUNK)
+    A = kkt_solve(local["k"], local["beta"], cu_seqlens=cu, chunk_size=CHUNK)
+    S_ext_r, M_r_last, M_r_first = inter_card_cp_prepare_hm(
+        k=local["k"], v=local["v"], a=A, g=g_c, beta=local["beta"],
+        cp_context=ctx, state_v_first=False, output_mt_first=True,
+    )
+    S_ext_r_f = S_ext_r.float()
+    M_r_last_f = M_r_last.float()
+    S_neigh, M_neigh = inter_card_cp_all_gather_hm(
+        S_ext_r=S_ext_r_f, M_r=M_r_last_f, V=V, group=ctx.group, cp_context=ctx,
+    )
+    if not ctx.is_first_rank:
+        init_r = inter_card_cp_correct_initial_states(S_neigh=S_neigh, M_neigh=M_neigh, Hv=Hv, K=K, V=V)
+        raw_h0 = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=local["k"].device)
+        raw_h0[0] = init_r
+    else:
+        raw_h0 = None
+
+    o, _, _ = fused_gdr_fwd(
+        q=local["q"], k=local["k"], v=local["v"], a=A, g=g_c, b=local["beta"],
+        scale=scale, initial_state=raw_h0, output_final_state=False, output_h=False,
+        output_o=True, cu_seqlens=cu, cp_seq_map=None, raw_cu_seqlens=None,
+    )
+    do = torch.ones_like(o)
+    M_r_first_f = M_r_first.float()
+
+    def run(t):
+        with t.mark("bwd/prepare_dhm"):
+            dS_ext_r = inter_card_cp_prepare_dhm(
+                q=local["q"], k=local["k"], v=local["v"], a=A, g=g_c,
+                beta=local["beta"], do=do, scale=scale,
+                cp_context=ctx, state_v_first=False,
+            ).float()
+        with t.mark("bwd/all_gather"):
+            dS_neigh, dM_neigh = inter_card_cp_all_gather_dhm(
+                dS_ext_r=dS_ext_r, M_r=M_r_first_f, V=V,
+                group=ctx.group, cp_context=ctx,
+            )
+        with t.mark("bwd/inter_scan"):
+            if not ctx.is_last_rank:
+                term_r = inter_card_cp_correct_terminal_states(
+                    dS_neigh=dS_neigh, M_neigh=dM_neigh, Hv=Hv, K=K, V=V,
+                )
+                corrected_dht = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=local["k"].device)
+                corrected_dht[N - 1] = term_r
+            else:
+                corrected_dht = None
+        with t.mark("bwd/recompute_h"):
+            h, _, _ = fused_gdr_h(
+                k=local["k"], v=local["v"], a=A, g=g_c, b=local["beta"],
+                initial_state=raw_h0, output_final_state=False, output_h=True,
+                cu_seqlens=cu, state_v_first=False,
+            )
+        with t.mark("bwd/main_bwd"):
+            dq, dk, dv, dg, db, _ = fused_gdr_bwd(
+                q=local["q"], k=local["k"], v=local["v"], a=A, g=g_c, b=local["beta"],
+                do=do, dht=corrected_dht, h=h, scale=scale,
+                cu_seqlens=cu, state_v_first=False,
+            )
+        with t.mark("bwd/postprocess"):
+            if Hg < Hv:
+                dq = group_reduce_vector(dq, Hg)
+                dk = group_reduce_vector(dk, Hg)
+            chunk_local_cumsum(dg, chunk_size=CHUNK, reverse=True, cu_seqlens=cu)
+
+    timer.bench(run, timer)
+
+    # e2e backward
+    def run_e2e(t):
+        q_t = local["q"].clone().requires_grad_(True)
+        k_t = local["k"].clone().requires_grad_(True)
+        v_t = local["v"].clone().requires_grad_(True)
+        g_t = local["g"].clone().requires_grad_(True)
+        b_t = local["beta"].clone().requires_grad_(True)
+        with t.mark("bwd/e2e"):
+            o_t, _ = chunk_gated_delta_rule_qla(
+                q_t, k_t, v_t, g_t, b_t, scale=scale, cp_context=ctx,
+            )
+            o_t.sum().backward()
+
+    timer.bench(run_e2e, timer)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -295,7 +511,9 @@ def profile_one(
     baseline_no_cp(timer, local, ctx.cu_seqlens, inputs["scale"])
     if use_fla:
         baseline_fla_cp(timer, local, inputs["cu_g"], inputs["scale"])
+        baseline_fla_cp_bwd(timer, local, inputs["cu_g"], inputs["scale"])
     cp_fwd_stages(timer, local, ctx, inputs)
+    cp_bwd_stages(timer, local, ctx, inputs)
 
     if rank == 0:
         import pandas as pd
@@ -305,55 +523,94 @@ def profile_one(
         def _g(tag):
             return r.get(tag, NAN)
 
-        rows = OrderedDict()
+        # ---- Forward 表 ----
+        fwd_rows = OrderedDict()
+        fwd_rows["cumsum"]       = {"full": _g("full/cumsum"),    "base": _g("base/cumsum"),    "qla_cp": _g("cp/cumsum")}
+        fwd_rows["kkt_solve"]    = {"full": _g("full/kkt_solve"), "base": _g("base/kkt_solve"), "qla_cp": _g("cp/kkt_solve")}
         if use_fla:
-            for row in rows.values():
-                row["fla_cp"] = NAN
-        rows["cumsum"]       = {"full": _g("full/cumsum"),    "base": _g("base/cumsum"),    "qla_cp": _g("cp/cumsum")}
-        rows["kkt_solve"]    = {"full": _g("full/kkt_solve"), "base": _g("base/kkt_solve"), "qla_cp": _g("cp/kkt_solve")}
+            fwd_rows["cp_preprocess"] = {"full": NAN, "base": NAN, "qla_cp": NAN, "fla_cp": _g("fla/cp_preprocess")}
+        fwd_rows["prepare_h"]    = {"full": NAN,                  "base": NAN,                  "qla_cp": _g("cp/prepare_h")}
+        fwd_rows["all_gather"]   = {"full": NAN,                  "base": NAN,                  "qla_cp": _g("cp/all_gather")}
+        fwd_rows["inter_scan"]   = {"full": NAN,                  "base": NAN,                  "qla_cp": _g("cp/inter_scan")}
         if use_fla:
-            rows["cp_preprocess"] = {"full": NAN, "base": NAN, "qla_cp": NAN, "fla_cp": _g("fla/cp_preprocess")}
-        rows["prepare_h"]    = {"full": NAN,                  "base": NAN,                  "qla_cp": _g("cp/prepare_h")}
-        rows["all_gather"]   = {"full": NAN,                  "base": NAN,                  "qla_cp": _g("cp/all_gather")}
-        rows["inter_scan"]   = {"full": NAN,                  "base": NAN,                  "qla_cp": _g("cp/inter_scan")}
-        if use_fla:
-            rows["fused_fwd"]    = {"full": _g("full/fused_fwd"), "base": _g("base/fused_fwd"), "qla_cp": _g("cp/main_fwd"), "fla_cp": _g("fla/intra_fwd") + _g("fla/fwd_h") + _g("fla/fwd_o")}
+            fwd_rows["fused_fwd"]    = {"full": _g("full/fused_fwd"), "base": _g("base/fused_fwd"), "qla_cp": _g("cp/main_fwd"), "fla_cp": _g("fla/fwd_h") + _g("fla/fwd_o")}
         else:
-            rows["fused_fwd"]    = {"full": _g("full/fused_fwd"), "base": _g("base/fused_fwd"), "qla_cp": _g("cp/main_fwd")}
+            fwd_rows["fused_fwd"]    = {"full": _g("full/fused_fwd"), "base": _g("base/fused_fwd"), "qla_cp": _g("cp/main_fwd")}
 
         if use_fla:
-            rows["cumsum"]["fla_cp"] = _g("fla/cumsum")
+            fwd_rows["cumsum"]["fla_cp"] = _g("fla/cumsum")
+            fwd_rows["kkt_solve"]["fla_cp"] = _g("fla/intra_fwd")
 
         full_total = sum(r.get(f"full/{k}", 0) for k in ("cumsum", "kkt_solve", "fused_fwd"))
         base_total = sum(r.get(f"base/{k}", 0) for k in ("cumsum", "kkt_solve", "fused_fwd"))
-        rows["TOTAL"] = {"full": full_total, "base": base_total, "qla_cp": _g("cp/e2e")}
+        fwd_rows["TOTAL"] = {"full": full_total, "base": base_total, "qla_cp": _g("cp/e2e")}
         if use_fla:
-            rows["TOTAL"]["fla_cp"] = _g("fla/e2e")
+            fwd_rows["TOTAL"]["fla_cp"] = _g("fla/e2e")
 
-        col_labels = {
+        fwd_col_labels = {
             "full": f"整条单卡(T={T})",
             "base": f"同片非CP(T/W={part})",
-            "qla_cp": f"QLA CP(T/W={part})",
+            "qla_cp": f"QLA CP fwd(T/W={part})",
         }
         if use_fla:
-            col_labels["fla_cp"] = f"FLA CP(T/W={part})"
+            fwd_col_labels["fla_cp"] = f"FLA CP fwd(T/W={part})"
 
-        df = pd.DataFrame(rows).T.reindex(columns=col_labels.keys())
-        df.columns = [col_labels[c] for c in df.columns]
+        df_fwd = pd.DataFrame(fwd_rows).T.reindex(columns=fwd_col_labels.keys())
+        df_fwd.columns = [fwd_col_labels[c] for c in df_fwd.columns]
         print(f"\n{'='*72}")
-        print(df.round(4).to_string())
+        print("Forward:")
+        print(df_fwd.round(4).to_string())
         print(f"{'='*72}")
 
         cp_e2e = r.get("cp/e2e", 0)
-        print(f"CP tax vs no-CP:  {cp_e2e - base_total:.4f} ms ({cp_e2e / max(base_total, 1e-9):.2f}x)")
-        print(f"CP vs full-seq:   {full_total / max(cp_e2e, 1e-9):.2f}x speedup")
+        print(f"CP fwd tax vs no-CP:  {cp_e2e - base_total:.4f} ms ({cp_e2e / max(base_total, 1e-9):.2f}x)")
+        print(f"CP fwd vs full-seq:   {full_total / max(cp_e2e, 1e-9):.2f}x speedup")
         if use_fla:
             fla_e2e = r.get("fla/e2e", 0)
-            print(f"QLA vs FLA CP:    {fla_e2e / max(cp_e2e, 1e-9):.2f}x (>1 = QLA faster)")
+            print(f"QLA vs FLA CP fwd:    {fla_e2e / max(cp_e2e, 1e-9):.2f}x (>1 = QLA faster)")
+
+        # ---- Backward 表 ----
+        bwd_rows = OrderedDict()
+        bwd_rows["prepare_dhm"]  = {"qla_cp_bwd": _g("bwd/prepare_dhm")}
+        bwd_rows["all_gather"]   = {"qla_cp_bwd": _g("bwd/all_gather")}
+        bwd_rows["inter_scan"]   = {"qla_cp_bwd": _g("bwd/inter_scan")}
+        bwd_rows["recompute_h"]  = {"qla_cp_bwd": _g("bwd/recompute_h")}
+        bwd_rows["main_bwd"]     = {"qla_cp_bwd": _g("bwd/main_bwd")}
+        bwd_rows["postprocess_gva"]  = {"qla_cp_bwd": _g("bwd/postprocess")}
+        bwd_rows["dv_local"]      = {"qla_cp_bwd": NAN}
+        bwd_rows["cp_preprocess"] = {"qla_cp_bwd": NAN}
+        bwd_rows["TOTAL"]        = {"qla_cp_bwd": _g("bwd/e2e")}
+        if use_fla:
+            bwd_rows["recompute_h"]["fla_cp_bwd"]   = _g("fla_bwd/recompute_wu") + _g("fla_bwd/recompute_h")
+            bwd_rows["dv_local"]      = {"qla_cp_bwd": NAN, "fla_cp_bwd": _g("fla_bwd/dv_local")}
+            bwd_rows["prepare_dhm"]["fla_cp_bwd"]  = NAN
+            bwd_rows["all_gather"]["fla_cp_bwd"]    = NAN
+            bwd_rows["inter_scan"]["fla_cp_bwd"]    = NAN
+            bwd_rows["cp_preprocess"] = {"qla_cp_bwd": NAN, "fla_cp_bwd": _g("fla_bwd/cp_preprocess")}
+            bwd_rows["main_bwd"]["fla_cp_bwd"]      = _g("fla_bwd/bwd_dhu") + _g("fla_bwd/dqkwg") + _g("fla_bwd/wy_bwd")
+            bwd_rows["postprocess_gva"]["fla_cp_bwd"]   = NAN
+            # fla 的 CP 相关
+            bwd_rows["TOTAL"]["fla_cp_bwd"]         = _g("fla_bwd/e2e")
+
+        bwd_col_labels = {"qla_cp_bwd": f"QLA CP bwd(T/W={part})"}
+        if use_fla:
+            bwd_col_labels["fla_cp_bwd"] = f"FLA CP bwd(T/W={part})"
+
+        df_bwd = pd.DataFrame(bwd_rows).T.reindex(columns=bwd_col_labels.keys())
+        df_bwd.columns = [bwd_col_labels[c] for c in df_bwd.columns]
+        print(f"\n{'='*72}")
+        print("Backward:")
+        print(df_bwd.round(4).to_string())
+        print(f"{'='*72}")
+
+        bwd_e2e = r.get("bwd/e2e", 0)
+        if use_fla:
+            fla_bwd_e2e = r.get("fla_bwd/e2e", 0)
+            print(f"QLA vs FLA CP bwd:    {fla_bwd_e2e / max(bwd_e2e, 1e-9):.2f}x (>1 = QLA faster)")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Profile 单层 inter-card CP 前向")
+    parser = argparse.ArgumentParser(description="Profile 单层 inter-card CP 前向+后向")
     parser.add_argument("--set", type=str, default=None,
                         help="Preset name (loads from profile/settings/{set}.csv)")
     parser.add_argument("--seqlen", "--num-tokens", type=int, default=16384, help="全局 T")

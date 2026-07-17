@@ -2,21 +2,22 @@
 # Licensed under The MIT License [see LICENSE for details]
 """单层 inter-card CP 的 autograd Function（当前主线）。
 
-把 inter-card 整条前向逻辑收拢于此，与核心 `ChunkGatedDeltaRuleFunction`（intra/非 CP）
+把 inter-card 整条前向/后向逻辑收拢于此，与核心 `ChunkGatedDeltaRuleFunction`（intra/非 CP）
 **完全分离**。公共入口 `chunk_gated_delta_rule(cp_context=...)` 分派到这里。
 
 前向：自算 g_c/A → `inter_card_cp_preprocess_fwd`（跨卡 pre+all_gather+inter_scan）→
-主前向 `fused_gdr_fwd`（无 intra 子序列并行）。后向下一轮实现。
+主前向 `fused_gdr_fwd`（无 intra 子序列并行）。
+后向：对称——`inter_card_cp_preprocess_bwd`（跨卡 dh scan）→ 重算 h → `fused_gdr_bwd`。
 """
 
 from __future__ import annotations
 
 import torch
 
-from flash_qla.utils import input_guard, l2norm_fwd
+from flash_qla.utils import input_guard, l2norm_fwd, l2norm_bwd
 from flash_qla.ops.utils import chunk_local_cumsum
 
-from .preprocess import inter_card_cp_preprocess_fwd
+from .preprocess import inter_card_cp_preprocess_fwd, inter_card_cp_preprocess_bwd
 
 
 class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -36,7 +37,6 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_final_state: bool,
         cp_context,
     ):
-        # 懒导入 chunk/__init__ 的符号，避免循环依赖
         from flash_qla.ops.gated_delta_rule.chunk import CHUNK_SIZE, kkt_solve, fused_gdr_fwd
 
         q_rstd, k_rstd = None, None
@@ -48,10 +48,11 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
         g = chunk_local_cumsum(g=g, cu_seqlens=cu, chunk_size=CHUNK_SIZE)
         A = kkt_solve(k=k, b=beta, cu_seqlens=cu, chunk_size=CHUNK_SIZE)
 
-        # 跨卡还原本卡首序列 incoming 初态（首 rank 为 None）
-        raw_h0 = inter_card_cp_preprocess_fwd(
+        # 跨卡还原本卡首序列 incoming 初态 + 取首序列 M（供 backward 用），一趟 prepare_h
+        raw_h0, M_r_first = inter_card_cp_preprocess_fwd(
             k=k, v=v, a=A, g=g, beta=beta,
             cp_context=cp_context, state_v_first=state_v_first,
+            output_mt_first=True,
         )
 
         o, _, final_state = fused_gdr_fwd(
@@ -67,19 +68,92 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
             state_v_first=state_v_first,
         )
 
-        # 保存供后向（下一轮实现）
         ctx.save_for_backward(q, k, q_rstd, k_rstd, v, g, beta, A, cu)
         ctx.scale = scale
         ctx.state_v_first = state_v_first
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx.cp_context = cp_context
+        ctx.raw_h0 = raw_h0
+        ctx.M_r_first = M_r_first
         return o.to(q.dtype), final_state
 
     @staticmethod
     @input_guard
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, do: torch.Tensor, dht: torch.Tensor):
-        raise NotImplementedError(
-            "inter-card CP backward 尚未实现（当前只支持前向）。"
-            "若需梯度，请暂勿在 cp_context 前向后调用 backward。"
+        from flash_qla.ops.gated_delta_rule.chunk import (
+            CHUNK_SIZE, fused_gdr_h, fused_gdr_bwd, fused_gdr_dh,
+        )
+        from flash_qla.ops.utils import group_reduce_vector
+
+        if fused_gdr_bwd is None or fused_gdr_dh is None:
+            raise NotImplementedError(
+                "inter-card CP backward 不支持 SM120（无 fused_gdr_bwd/fused_gdr_dh）。"
+            )
+
+        q, k, q_rstd, k_rstd, v, g, beta, A, cu = ctx.saved_tensors
+        scale = ctx.scale
+        state_v_first = ctx.state_v_first
+        cp_context = ctx.cp_context
+        raw_h0 = ctx.raw_h0
+        M_r_first = ctx.M_r_first
+
+        # 跨卡 backward 预处理：还原本卡末序列的 incoming 终态梯度
+        corrected_dht = inter_card_cp_preprocess_bwd(
+            q=q, k=k, v=v, a=A, g=g, beta=beta, do=do,
+            scale=scale, cp_context=cp_context,
+            state_v_first=state_v_first, M_r_first=M_r_first,
+        )
+
+        # 合并 autograd dht（final_state 的梯度）
+        if dht is not None:
+            if corrected_dht is None:
+                corrected_dht = dht
+            else:
+                corrected_dht[-1] = corrected_dht[-1] + dht[-1].float()
+
+        # 重算 h（forward 未保存 h，需以 raw_h0 为种子重算）
+        h, _, _ = fused_gdr_h(
+            k=k, v=v, a=A, g=g, b=beta,
+            initial_state=raw_h0,
+            output_final_state=False,
+            output_h=True,
+            cu_seqlens=cu,
+            state_v_first=state_v_first,
+        )
+
+        # 主 backward kernel
+        dq, dk, dv, dg, db, dh0 = fused_gdr_bwd(
+            q=q, k=k, v=v, a=A, g=g, b=beta,
+            do=do, dht=corrected_dht, h=h, scale=scale,
+            cu_seqlens=cu,
+            state_v_first=state_v_first,
+        )
+
+        # GQA head 归约
+        Hg, H = k.shape[-2], v.shape[-2]
+        if Hg < H:
+            dq = group_reduce_vector(dq, Hg)
+            dk = group_reduce_vector(dk, Hg)
+
+        # 反向 cumsum
+        assert dg.dtype == torch.float32, "dg should be fp32"
+        dg = chunk_local_cumsum(dg, chunk_size=CHUNK_SIZE, reverse=True, cu_seqlens=cu)
+
+        # L2norm 反向
+        if ctx.use_qk_l2norm_in_kernel:
+            dq = l2norm_bwd(q, q_rstd, dq)
+            dk = l2norm_bwd(k, k_rstd, dk)
+
+        return (
+            dq.to(q),    # q
+            dk.to(k),    # k
+            dv.to(v),    # v
+            dg.to(g),    # g
+            db.to(beta), # beta
+            None,         # scale
+            None,         # state_v_first
+            None,         # use_qk_l2norm_in_kernel
+            None,         # output_final_state
+            None,         # cp_context
         )
