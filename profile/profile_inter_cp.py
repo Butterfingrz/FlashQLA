@@ -44,9 +44,25 @@ from flash_qla.ops.gated_delta_rule.chunk.cp import (
     inter_card_cp_all_gather_dhm,
     inter_card_cp_correct_terminal_states,
 )
+from flash_qla.ops.gated_delta_rule.chunk.cp.comm import (
+    all_gather_into_tensor, pack_hm, unpack_hm,
+)
 
 CHUNK = 64
 FLA_LATEST_PATH = os.environ.get("FLA_LATEST", "/cpfs02/user/cenxi.lx/code/fla-latest")
+
+try:
+    from torch.cuda import nvtx
+    _nvtx_range = nvtx.range
+except (ImportError, AttributeError):
+    from contextlib import contextmanager as _cm
+    @_cm
+    def _nvtx_range(msg):
+        torch.cuda.nvtx.range_push(msg)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
 
 
 # ---------------------------------------------------------------------------
@@ -337,13 +353,13 @@ def cp_fwd_stages(timer: CudaTimer, local: dict, ctx, inputs: dict):
             S_ext_r = S_ext_r.float()
             M_r = M_r.float()
         with t.mark("cp/all_gather"):
-            S_neigh, M_neigh = inter_card_cp_all_gather_hm(
+            S_buf, M_buf = inter_card_cp_all_gather_hm(
                 S_ext_r=S_ext_r, M_r=M_r, V=V, group=ctx.group, cp_context=ctx,
             )
         with t.mark("cp/inter_scan"):
             if not ctx.is_first_rank:
                 init_r = inter_card_cp_correct_initial_states(
-                    S_neigh=S_neigh, M_neigh=M_neigh, Hv=Hv, K=K, V=V,
+                    S_buf=S_buf, M_buf=M_buf, cp_context=ctx,
                 )
                 raw_h0 = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=local["k"].device)
                 raw_h0[0] = init_r
@@ -395,11 +411,11 @@ def cp_bwd_stages(timer: CudaTimer, local: dict, ctx, inputs: dict):
     )
     S_ext_r_f = S_ext_r.float()
     M_r_last_f = M_r_last.float()
-    S_neigh, M_neigh = inter_card_cp_all_gather_hm(
+    S_buf, M_buf = inter_card_cp_all_gather_hm(
         S_ext_r=S_ext_r_f, M_r=M_r_last_f, V=V, group=ctx.group, cp_context=ctx,
     )
     if not ctx.is_first_rank:
-        init_r = inter_card_cp_correct_initial_states(S_neigh=S_neigh, M_neigh=M_neigh, Hv=Hv, K=K, V=V)
+        init_r = inter_card_cp_correct_initial_states(S_buf=S_buf, M_buf=M_buf, cp_context=ctx)
         raw_h0 = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=local["k"].device)
         raw_h0[0] = init_r
     else:
@@ -421,14 +437,14 @@ def cp_bwd_stages(timer: CudaTimer, local: dict, ctx, inputs: dict):
                 cp_context=ctx, state_v_first=False,
             ).float()
         with t.mark("bwd/all_gather"):
-            dS_neigh, dM_neigh = inter_card_cp_all_gather_dhm(
+            dS_buf, dM_buf = inter_card_cp_all_gather_dhm(
                 dS_ext_r=dS_ext_r, M_r=M_r_first_f, V=V,
                 group=ctx.group, cp_context=ctx,
             )
         with t.mark("bwd/inter_scan"):
             if not ctx.is_last_rank:
                 term_r = inter_card_cp_correct_terminal_states(
-                    dS_neigh=dS_neigh, M_neigh=dM_neigh, Hv=Hv, K=K, V=V,
+                    dS_buf=dS_buf, M_buf=dM_buf, cp_context=ctx,
                 )
                 corrected_dht = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=local["k"].device)
                 corrected_dht[N - 1] = term_r
@@ -468,6 +484,191 @@ def cp_bwd_stages(timer: CudaTimer, local: dict, ctx, inputs: dict):
             o_t.sum().backward()
 
     timer.bench(run_e2e, timer)
+
+
+# ---------------------------------------------------------------------------
+# NSYS mode: NVTX-annotated run, no CudaTimer profiling
+# ---------------------------------------------------------------------------
+
+def nsys_run(local: dict, ctx, inputs: dict, cu_g: torch.Tensor,
+             warmup: int = 5, rep: int = 3, use_cuda_graph: bool = False):
+    """NVTX 标注的 QLA stages + QLA e2e + FLA e2e 前向+后向，供 nsys 抓 trace 用。
+
+    四个过程串行：
+      1. qla_stages: QLA CP 各阶段拆解
+      2. qla_e2e: QLA CP e2e (autograd Function)
+      3. fla_e2e_fwd: FLA CP e2e 前向
+      4. fla_e2e_bwd: FLA CP e2e 前向+后向
+    """
+    scale = inputs["scale"]
+    cu = ctx.cu_seqlens
+    Hv = local["v"].shape[2]
+    Hg = local["k"].shape[2]
+    K = local["k"].shape[3]
+    V = local["v"].shape[3]
+    cu_cpu = ctx.cu_seqlens_cpu.tolist()
+    N = len(cu_cpu) - 1
+
+    # ---- FLA imports ----
+    if FLA_LATEST_PATH and FLA_LATEST_PATH not in sys.path:
+        sys.path.insert(0, FLA_LATEST_PATH)
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as chunk_gdn_fla
+    from fla.ops.cp import build_cp_context as build_cp_context_fla
+    ctx_fla = build_cp_context_fla(cu_g, group=dist.group.WORLD)
+
+    # ---- 1. QLA CP stages (fwd + bwd) ----
+    def qla_stages():
+        with _nvtx_range("qla_stages"):
+            with _nvtx_range("qla_stages/fwd"):
+                with _nvtx_range("cumsum"):
+                    g_c = chunk_local_cumsum(local["g"], cu_seqlens=cu, chunk_size=CHUNK)
+                with _nvtx_range("kkt_solve"):
+                    A = kkt_solve(local["k"], local["beta"], cu_seqlens=cu, chunk_size=CHUNK)
+                with _nvtx_range("prepare_h"):
+                    S_ext_r, M_r, M_r_first = inter_card_cp_prepare_hm(
+                        k=local["k"], v=local["v"], a=A, g=g_c, beta=local["beta"],
+                        cp_context=ctx, state_v_first=False, output_mt_first=True,
+                    )
+                    S_ext_r = S_ext_r.float()
+                    M_r = M_r.float()
+                with _nvtx_range("ag_pack"):
+                    hm = pack_hm(S_ext_r, M_r)
+                with _nvtx_range("ag_nccl"):
+                    ag_hm, _ = all_gather_into_tensor(hm, group=ctx.group)
+                with _nvtx_range("ag_unpack"):
+                    rank = dist.get_rank(group=ctx.group)
+                    pre = ctx.pre_num_ranks
+                    buf = ag_hm[rank - pre: rank + 1]
+                    S_buf, M_buf = unpack_hm(buf, V)
+                with _nvtx_range("inter_scan"):
+                    if not ctx.is_first_rank:
+                        init_r = inter_card_cp_correct_initial_states(
+                            S_buf=S_buf, M_buf=M_buf, cp_context=ctx,
+                        )
+                        raw_h0 = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=local["k"].device)
+                        raw_h0[0] = init_r
+                    else:
+                        raw_h0 = None
+                with _nvtx_range("main_fwd"):
+                    o, _, _ = fused_gdr_fwd(
+                        q=local["q"], k=local["k"], v=local["v"], a=A, g=g_c, b=local["beta"],
+                        scale=scale, initial_state=raw_h0, output_final_state=False, output_h=False,
+                        output_o=True, cu_seqlens=cu, cp_seq_map=None, raw_cu_seqlens=None,
+                    )
+            do = torch.ones_like(o)
+            M_r_first_f = M_r_first.float()
+            with _nvtx_range("qla_stages/bwd"):
+                with _nvtx_range("prepare_dhm"):
+                    dS_ext_r = inter_card_cp_prepare_dhm(
+                        q=local["q"], k=local["k"], v=local["v"], a=A, g=g_c,
+                        beta=local["beta"], do=do, scale=scale,
+                        cp_context=ctx, state_v_first=False,
+                    ).float()
+                with _nvtx_range("ag_pack"):
+                    hm_b = pack_hm(dS_ext_r, M_r_first_f)
+                with _nvtx_range("ag_nccl"):
+                    ag_hm_b, _ = all_gather_into_tensor(hm_b, group=ctx.group)
+                with _nvtx_range("ag_unpack"):
+                    rank = dist.get_rank(group=ctx.group)
+                    post = ctx.post_num_ranks
+                    buf_b = ag_hm_b[rank: rank + 1 + post]
+                    dS_buf, dM_buf = unpack_hm(buf_b, V)
+                with _nvtx_range("inter_scan"):
+                    if not ctx.is_last_rank:
+                        term_r = inter_card_cp_correct_terminal_states(
+                            dS_buf=dS_buf, M_buf=dM_buf, cp_context=ctx,
+                        )
+                        corrected_dht = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=local["k"].device)
+                        corrected_dht[N - 1] = term_r
+                    else:
+                        corrected_dht = None
+                with _nvtx_range("recompute_h"):
+                    h, _, _ = fused_gdr_h(
+                        k=local["k"], v=local["v"], a=A, g=g_c, b=local["beta"],
+                        initial_state=raw_h0, output_final_state=False, output_h=True,
+                        cu_seqlens=cu, state_v_first=False,
+                    )
+                with _nvtx_range("main_bwd"):
+                    dq, dk, dv, dg, db, _ = fused_gdr_bwd(
+                        q=local["q"], k=local["k"], v=local["v"], a=A, g=g_c, b=local["beta"],
+                        do=do, dht=corrected_dht, h=h, scale=scale,
+                        cu_seqlens=cu, state_v_first=False,
+                    )
+                with _nvtx_range("postprocess"):
+                    if Hg < Hv:
+                        dq = group_reduce_vector(dq, Hg)
+                        dk = group_reduce_vector(dk, Hg)
+                    chunk_local_cumsum(dg, chunk_size=CHUNK, reverse=True, cu_seqlens=cu)
+
+    # ---- 2. QLA e2e fwd+bwd ----
+    def qla_e2e():
+        q_t = local["q"].clone().requires_grad_(True)
+        k_t = local["k"].clone().requires_grad_(True)
+        v_t = local["v"].clone().requires_grad_(True)
+        g_t = local["g"].clone().requires_grad_(True)
+        b_t = local["beta"].clone().requires_grad_(True)
+        with _nvtx_range("qla_e2e"):
+            with _nvtx_range("qla_e2e/fwd"):
+                o, _ = chunk_gated_delta_rule_qla(
+                    q_t, k_t, v_t, g_t, b_t, scale=scale, cp_context=ctx,
+                )
+            with _nvtx_range("qla_e2e/bwd"):
+                o.sum().backward()
+
+    # ---- 3. FLA e2e fwd ----
+    def fla_e2e_fwd():
+        with _nvtx_range("fla_e2e_fwd"):
+            chunk_gdn_fla(
+                local["q"], local["k"], local["v"], local["g"], local["beta"],
+                scale=scale, cp_context=ctx_fla,
+            )
+
+    # ---- 4. FLA e2e fwd+bwd ----
+    def fla_e2e_bwd():
+        q_t = local["q"].clone().requires_grad_(True)
+        k_t = local["k"].clone().requires_grad_(True)
+        v_t = local["v"].clone().requires_grad_(True)
+        g_t = local["g"].clone().requires_grad_(True)
+        b_t = local["beta"].clone().requires_grad_(True)
+        with _nvtx_range("fla_e2e"):
+            with _nvtx_range("fla_e2e/fwd"):
+                o, _ = chunk_gdn_fla(
+                    q_t, k_t, v_t, g_t, b_t, scale=scale, cp_context=ctx_fla,
+                )
+            with _nvtx_range("fla_e2e/bwd"):
+                o.sum().backward()
+
+    all_passes = [qla_stages, qla_e2e, fla_e2e_fwd, fla_e2e_bwd]
+
+    if use_cuda_graph:
+        graphs = []
+        for fn in all_passes:
+            # warmup for graph capture
+            for _ in range(warmup):
+                fn()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                fn()
+            graphs.append(g)
+        torch.cuda.synchronize()
+        for i in range(rep):
+            with _nvtx_range(f"iter_{i}"):
+                for g in graphs:
+                    g.replay()
+        torch.cuda.synchronize()
+    else:
+        # warmup all passes
+        for _ in range(warmup):
+            for fn in all_passes:
+                fn()
+        torch.cuda.synchronize()
+        # profiled iterations
+        for i in range(rep):
+            with _nvtx_range(f"iter_{i}"):
+                for fn in all_passes:
+                    fn()
+        torch.cuda.synchronize()
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +823,10 @@ def main():
     parser.add_argument("--swa-ratio", type=float, default=0.75)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fla", action="store_true", help="同时 profile fla 的 inter-card CP")
+    parser.add_argument("--nsys", action="store_true",
+                        help="NSYS 模式：不做 CudaTimer profiling，只用 NVTX 标注跑流程")
+    parser.add_argument("--cuda-graph", action="store_true",
+                        help="用 CUDA Graph capture + replay 跑各过程（需配合 --nsys）")
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)
     args = parser.parse_args()
@@ -634,6 +839,30 @@ def main():
     W = dist.get_world_size()
 
     timer = CudaTimer(warmup=args.warmup, rep=args.rep)
+
+    if args.nsys:
+        cu = [int(x) for x in args.cu_seqlens.split("-")] if args.cu_seqlens else None
+        T = args.seqlen
+        assert T % W == 0
+        part = T // W
+        lo, hi = rank * part, (rank + 1) * part
+        inputs = generate_inputs(
+            num_tokens=T, num_k_heads=args.nkh, num_v_heads=args.nvh,
+            data_dtype=args.data_dtype, swa_ratio=args.swa_ratio,
+            random_seed=args.seed, cu_seqlens=cu,
+        )
+        local = slice_inputs(inputs, lo, hi)
+        ctx = build_cp_context(inputs["cu_g"], group=dist.group.WORLD)
+        if rank == 0:
+            print(f"[nsys] T={T} W={W} per-rank={part} Hk={args.nkh} Hv={args.nvh} "
+                  f"warmup={args.warmup} rep={args.rep} cuda_graph={args.cuda_graph}")
+        nsys_run(local, ctx, inputs, cu_g=inputs["cu_g"],
+                 warmup=args.warmup, rep=args.rep,
+                 use_cuda_graph=args.cuda_graph)
+        if rank == 0:
+            print("[nsys] done")
+        dist.destroy_process_group()
+        return
 
     if args.set is not None:
         import pandas as pd

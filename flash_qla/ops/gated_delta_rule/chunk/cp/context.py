@@ -36,6 +36,28 @@ class FLACPContext:
     post_num_ranks: int | None = None                # 后面同属本卡末序列的 rank 数（bwd merge 循环数）
     conv1d_kernel_size: int | None = None            # conv halo 用（本轮范围外，仅占位）
     pre_num_conv_tokens: int | None = None
+    fwd_scan_seq_map: torch.Tensor | None = None     # [0, pre_num_ranks+1] int32 on GPU
+    fwd_scan_fb_mask: torch.Tensor | None = None     # [pre_num_ranks+1, Hv] bool on GPU
+    bwd_scan_seq_map: torch.Tensor | None = None     # [0, post_num_ranks+1] int32 on GPU
+    bwd_scan_fb_mask: torch.Tensor | None = None     # [post_num_ranks+1, Hv] bool on GPU
+
+    def get_fwd_scan_tensors(self, Hv: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.fwd_scan_seq_map is None:
+            J = self.pre_num_ranks
+            seq_map = torch.zeros(2, dtype=torch.int32, device=device)
+            seq_map[1] = J + 1
+            self.fwd_scan_seq_map = seq_map
+            self.fwd_scan_fb_mask = torch.ones((J + 1, Hv), dtype=torch.bool, device=device)
+        return self.fwd_scan_seq_map, self.fwd_scan_fb_mask
+
+    def get_bwd_scan_tensors(self, Hv: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.bwd_scan_seq_map is None:
+            J = self.post_num_ranks
+            seq_map = torch.zeros(2, dtype=torch.int32, device=device)
+            seq_map[1] = J + 1
+            self.bwd_scan_seq_map = seq_map
+            self.bwd_scan_fb_mask = torch.ones((J + 1, Hv), dtype=torch.bool, device=device)
+        return self.bwd_scan_seq_map, self.bwd_scan_fb_mask
 
     def copy_for_backward(self) -> "FLACPContext":
         return FLACPContext(

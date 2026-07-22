@@ -63,55 +63,37 @@ def inter_card_cp_all_gather_hm(
     group: dist.ProcessGroup,
     cp_context,  # FLACPContext（rank-local）
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """跨卡 all_gather 本 rank 的 (S_ext, M) 到所有 rank，返回邻居的 (S_ext, M)。
-    W = group size，H = num_v_heads，K = num_k_heads，V = value dim。
+    """跨卡 all_gather，返回 J+1 个 (S, M)：前 J 个是 pre-neighbors，
+    最后一个是本 rank 自身（exclusive scan 不读 last element）。
     """
     hm = pack_hm(S_ext_r, M_r)                                  # [H, K, V+K]
     ag_hm, _ = all_gather_into_tensor(hm, group=group)          # [W, H, K, V+K]
     rank = dist.get_rank(group=group)
     pre = cp_context.pre_num_ranks
-    neigh = ag_hm[rank - pre: rank]                             # [pre, H, K, V+K]（从前往后）
-    S_neigh, M_neigh = unpack_hm(neigh, V)
-    return S_neigh, M_neigh
+    buf = ag_hm[rank - pre: rank + 1]                           # [pre+1, H, K, V+K]
+    S_buf, M_buf = unpack_hm(buf, V)
+    return S_buf, M_buf
 
 def inter_card_cp_correct_initial_states(
-    S_neigh: torch.Tensor,  # [J, H, K, V]，邻居的 S_ext
-    M_neigh: torch.Tensor,  # [J, H, K, K]
-    Hv: int,
-    K: int,
-    V: int,
+    S_buf: torch.Tensor,  # [J+1, H, K, V]
+    M_buf: torch.Tensor,  # [J+1, H, K, K]
+    cp_context,
     state_v_first: bool = False,
 ):
-    """返回本卡首序列的跨卡 incoming 初态 `raw_h0`（[N_local, H, K, V] fp32，仅 [0] 非零），
-    首 rank 返回 None（序列真正起点，无 incoming）。
-
-    cu_seqlens 取自 `cp_context.cu_seqlens`（rank-local）。
-    """
     assert not state_v_first, "单层 inter-card CP 暂只支持 state_v_first=False"
-    # 复用 correct_initial_states kernel 做跨卡 exclusive prefix scan。
-    # kernel 输出 cp_h0[i] = 处理前 i 个元素后的状态（exclusive），而我们需要处理完
-    # 所有 J 个邻居后的结果（inclusive）。在末尾 pad 一个 dummy 元素使 num_iters = J+1，
-    # 循环体跑 J 次恰好覆盖真实邻居，cp_h0[J] 即为 inclusive scan 结果。
-    # dummy 位置的 ht/mt 不会被 kernel 循环体读取（只在 last_idx 写出）。
     from flash_qla.ops.gated_delta_rule.chunk import correct_initial_states
-    
-    J = S_neigh.shape[0]
-    pad_S = torch.zeros((1, Hv, K, V), dtype=S_neigh.dtype, device=S_neigh.device)
-    pad_M = torch.zeros((1, Hv, K, K), dtype=M_neigh.dtype, device=M_neigh.device)
-    ht_buf = torch.cat([S_neigh, pad_S], dim=0)                 # [J+1, H, K, V]
-    mt_buf = torch.cat([M_neigh, pad_M], dim=0)                 # [J+1, H, K, K]
-    fb_mask = torch.ones((J + 1, Hv), dtype=torch.bool, device=S_neigh.device)
-    seq_map = torch.tensor([0, J + 1], dtype=torch.int32, device=S_neigh.device)
+
+    Hv = S_buf.shape[1]
+    seq_map, fb_mask = cp_context.get_fwd_scan_tensors(Hv, S_buf.device)
     cp_h0_all = correct_initial_states(
         raw_h0=None,
-        ht_buffer=ht_buf,
-        mt_buffer=mt_buf,
+        ht_buffer=S_buf,
+        mt_buffer=M_buf,
         fallback_mask=fb_mask,
         seq_map_r2c=seq_map,
         state_v_first=state_v_first,
     )
-    initial_state_r = cp_h0_all[J]                               # [H, K, V] inclusive scan result
-    return initial_state_r
+    return cp_h0_all[S_buf.shape[0] - 1]
 
 def inter_card_cp_preprocess_fwd(
     k: torch.Tensor,
@@ -152,7 +134,7 @@ def inter_card_cp_preprocess_fwd(
     S_ext_r = S_ext_r.float()
     M_r = M_r.float()
 
-    S_neigh, M_neigh = inter_card_cp_all_gather_hm(
+    S_buf, M_buf = inter_card_cp_all_gather_hm(
         S_ext_r=S_ext_r, M_r=M_r, V=V, group=group, cp_context=cp_context
     )
 
@@ -162,7 +144,7 @@ def inter_card_cp_preprocess_fwd(
         return None
 
     initial_state_r = inter_card_cp_correct_initial_states(
-        S_neigh=S_neigh, M_neigh=M_neigh, Hv=Hv, K=K, V=V, state_v_first=state_v_first
+        S_buf=S_buf, M_buf=M_buf, cp_context=cp_context, state_v_first=state_v_first,
     )
 
     raw_h0 = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=k.device)
@@ -224,55 +206,38 @@ def inter_card_cp_all_gather_dhm(
     group: dist.ProcessGroup,
     cp_context,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """跨卡 all_gather backward 聚合量，返回 post-neighbors（已翻转为 scan 顺序）。
-
-    forward 取 pre-neighbors [r-pre:r]；backward 取 post-neighbors [r+1:r+1+post]
-    并翻转——scan 从最远 rank 开始。
+    """跨卡 all_gather backward，返回 J+1 个 (dS, M)：第一个是本 rank 自身
+    （reverse exclusive scan 不读 element 0），后 J 个是 post-neighbors（自然顺序）。
     """
     hm = pack_hm(dS_ext_r, M_r)                         # [H, K, V+K]
     ag_hm, _ = all_gather_into_tensor(hm, group=group)   # [W, H, K, V+K]
     rank = dist.get_rank(group=group)
     post = cp_context.post_num_ranks
-    neigh = ag_hm[rank + 1: rank + 1 + post]             # [post, H, K, V+K]
-    neigh = neigh.flip(0)
-    dS_neigh, M_neigh = unpack_hm(neigh, V)
-    return dS_neigh, M_neigh
+    buf = ag_hm[rank: rank + 1 + post]                   # [post+1, H, K, V+K]
+    dS_buf, M_buf = unpack_hm(buf, V)
+    return dS_buf, M_buf
 
 
 def inter_card_cp_correct_terminal_states(
-    dS_neigh: torch.Tensor,  # [J, H, K, V]，post-neighbors，已翻转
-    M_neigh: torch.Tensor,   # [J, H, K, K]，post-neighbors，已翻转
-    Hv: int,
-    K: int,
-    V: int,
+    dS_buf: torch.Tensor,  # [J+1, H, K, V]
+    M_buf: torch.Tensor,   # [J+1, H, K, K]
+    cp_context,
     state_v_first: bool = False,
 ):
-    """反向 prefix scan：`dh = M^T @ dh + dS_ext`，等价于用 M^T 做前向 scan。
-
-    复用 `correct_initial_states`（与 forward 相同的 kernel），传入 M^T。
-    """
     assert not state_v_first, "单层 inter-card CP 暂只支持 state_v_first=False"
-    from flash_qla.ops.gated_delta_rule.chunk import correct_initial_states
+    from flash_qla.ops.gated_delta_rule.chunk import correct_terminal_states
 
-    J = dS_neigh.shape[0]
-    M_neigh_T = M_neigh.transpose(-1, -2).contiguous()
-
-    pad_dS = torch.zeros((1, Hv, K, V), dtype=dS_neigh.dtype, device=dS_neigh.device)
-    pad_M = torch.zeros((1, Hv, K, K), dtype=M_neigh_T.dtype, device=M_neigh_T.device)
-    dht_buf = torch.cat([dS_neigh, pad_dS], dim=0)       # [J+1, H, K, V]
-    mt_buf = torch.cat([M_neigh_T, pad_M], dim=0)        # [J+1, H, K, K]
-    fb_mask = torch.ones((J + 1, Hv), dtype=torch.bool, device=dS_neigh.device)
-    seq_map = torch.tensor([0, J + 1], dtype=torch.int32, device=dS_neigh.device)
-
-    cp_dht_all = correct_initial_states(
-        raw_h0=None,
-        ht_buffer=dht_buf,
-        mt_buffer=mt_buf,
+    Hv = dS_buf.shape[1]
+    seq_map, fb_mask = cp_context.get_bwd_scan_tensors(Hv, dS_buf.device)
+    cp_dht_all = correct_terminal_states(
+        raw_dht=None,
+        dht_buffer=dS_buf,
+        mt_buffer=M_buf,
         fallback_mask=fb_mask,
         seq_map_r2c=seq_map,
         state_v_first=state_v_first,
     )
-    return cp_dht_all[J]  # [H, K, V] inclusive scan result
+    return cp_dht_all[0]
 
 
 def inter_card_cp_preprocess_bwd(
@@ -311,7 +276,7 @@ def inter_card_cp_preprocess_bwd(
     M_r_f = M_r_first.float() if M_r_first is not None else torch.zeros(
         (Hv, K, K), dtype=torch.float32, device=k.device)
 
-    dS_neigh, M_neigh = inter_card_cp_all_gather_dhm(
+    dS_buf, M_buf = inter_card_cp_all_gather_dhm(
         dS_ext_r=dS_ext_r, M_r=M_r_f, V=V, group=group, cp_context=cp_context,
     )
 
@@ -319,7 +284,7 @@ def inter_card_cp_preprocess_bwd(
         return None
 
     terminal_state_r = inter_card_cp_correct_terminal_states(
-        dS_neigh=dS_neigh, M_neigh=M_neigh, Hv=Hv, K=K, V=V, state_v_first=state_v_first,
+        dS_buf=dS_buf, M_buf=M_buf, cp_context=cp_context, state_v_first=state_v_first,
     )
 
     corrected_dht = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=k.device)

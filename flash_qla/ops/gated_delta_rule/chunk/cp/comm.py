@@ -43,6 +43,6 @@ def pack_hm(S_ext: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
 
 def unpack_hm(hm: torch.Tensor, v_head_dim: int):
     """`pack_hm` 的逆：从 `hm[..., K, V+K]` 拆回 `(S_ext[..., K, V], M[..., K, K])`。"""
-    S_ext = hm[..., :v_head_dim]
-    M = hm[..., v_head_dim:]
+    S_ext = hm[..., :v_head_dim].contiguous()
+    M = hm[..., v_head_dim:].contiguous()
     return S_ext, M
