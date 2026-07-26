@@ -376,12 +376,10 @@ def chunk_gated_delta_rule(
     if cp_context is not None and cp_context.is_cp_enabled:
         if q.shape[0] != 1:
             raise ValueError("inter-card CP requires B==1 (varlen).")
-        if initial_state is not None:
-            raise ValueError("inter-card CP does not support user `initial_state`.")
         if scale is None:
             scale = k.shape[-1] ** -0.5
         o, final_state = CPChunkGatedDeltaRuleFunction.apply(
-            q, k, v, g, beta, scale, state_v_first, use_qk_l2norm_in_kernel, output_final_state, cp_context,
+            q, k, v, g, beta, scale, initial_state, state_v_first, use_qk_l2norm_in_kernel, output_final_state, cp_context,
         )
         return o, final_state
 

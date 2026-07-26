@@ -26,14 +26,13 @@ def inter_card_cp_prepare_hm(
     cp_context,               # FLACPContext（rank-local）
     state_v_first: bool = False,
     output_mt_first: bool = False,
+    initial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """返回本卡最后一个 chunk 的 `(S_ext_r, M_r)`，用于跨卡 all_gather。
-    S_ext_r = ht[-1]，M_r = mt[-1]，均为 fp32。
 
-    若 output_mt_first=True，同时返回首序列的 mt[0]（供 backward 跨卡 scan 用）。
-    此时 num_warmup 对首尾两条序列都设全量，一趟 kernel 同时取到。
+    initial_state: 用户初态（仅 first rank 有意义），传给 fused_gdr_h 使 S_ext 包含 h0 的贡献。
     """
-    assert not state_v_first, "单层 inter-card CP 暂只支持 state_v_first=False"
+
     from flash_qla.ops.gated_delta_rule.chunk import fused_gdr_h
 
     cu = cp_context.cu_seqlens
@@ -49,7 +48,7 @@ def inter_card_cp_prepare_hm(
 
     _, ht, mt = fused_gdr_h(
         k=k, v=v, a=a, g=g, b=beta,
-        initial_state=None, output_final_state=True, output_h=False,
+        initial_state=initial_state, output_final_state=True, output_h=False,
         cu_seqlens=cu, num_warmup_chunks=num_warmup, state_v_first=state_v_first,
     )
     if output_mt_first:
@@ -80,7 +79,7 @@ def inter_card_cp_correct_initial_states(
     cp_context,
     state_v_first: bool = False,
 ):
-    assert not state_v_first, "单层 inter-card CP 暂只支持 state_v_first=False"
+
     from flash_qla.ops.gated_delta_rule.chunk import correct_initial_states
 
     Hv = S_buf.shape[1]
@@ -104,14 +103,15 @@ def inter_card_cp_preprocess_fwd(
     cp_context,               # FLACPContext（rank-local）
     state_v_first: bool = False,
     output_mt_first: bool = False,
+    initial_state: torch.Tensor | None = None,
 ):
     """返回本卡首序列的跨卡 incoming 初态 `raw_h0`（[N_local, H, K, V] fp32，仅 [0] 非零），
-    首 rank 返回 None（序列真正起点，无 incoming）。
+    首 rank 返回 initial_state（序列真正起点）。
 
     若 output_mt_first=True，同时返回首序列的 M（供 backward 跨卡 scan 用）。
     返回 `(raw_h0, M_r_first)` 或 `(None, M_r_first)`。
     """
-    assert not state_v_first, "单层 inter-card CP 暂只支持 state_v_first=False"
+
 
     group = cp_context.group
     cu = cp_context.cu_seqlens
@@ -124,6 +124,7 @@ def inter_card_cp_preprocess_fwd(
     hm_result = inter_card_cp_prepare_hm(
         k=k, v=v, a=a, g=g, beta=beta, cp_context=cp_context,
         state_v_first=state_v_first, output_mt_first=output_mt_first,
+        initial_state=initial_state,
     )
     if output_mt_first:
         S_ext_r, M_r, M_r_first = hm_result
@@ -138,17 +139,26 @@ def inter_card_cp_preprocess_fwd(
         S_ext_r=S_ext_r, M_r=M_r, V=V, group=group, cp_context=cp_context
     )
 
+    # first rank does not need correction
     if cp_context.is_first_rank:
         if output_mt_first:
-            return None, M_r_first
-        return None
+            return initial_state, M_r_first
+        return initial_state
 
     initial_state_r = inter_card_cp_correct_initial_states(
-        S_buf=S_buf, M_buf=M_buf, cp_context=cp_context, state_v_first=state_v_first,
+        S_buf=S_buf, M_buf=M_buf, cp_context=cp_context,
+        state_v_first=state_v_first,
     )
 
-    raw_h0 = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=k.device)
+    if state_v_first:
+        raw_h0 = torch.zeros((N, Hv, V, K), dtype=torch.float32, device=k.device)
+    else:
+        raw_h0 = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=k.device)
+    # first partial sequence set to initial_state_r
     raw_h0[0] = initial_state_r
+    # other sequences set to initial_state
+    if initial_state is not None and N > 1:
+        raw_h0[1:] = initial_state[1:]
     if output_mt_first:
         return raw_h0, M_r_first
     return raw_h0
@@ -169,12 +179,9 @@ def inter_card_cp_prepare_dhm(
     scale: float,
     cp_context,
     state_v_first: bool = False,
+    dht: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """返回本卡首序列的 `dS_ext_r`（dht=0 时的 dh0），用于跨卡 backward all_gather。
 
-    M_r 由 forward 缓存传入（见 function.py），此处不再重算。
-    """
-    assert not state_v_first, "单层 inter-card CP 暂只支持 state_v_first=False"
     from flash_qla.ops.gated_delta_rule.chunk import fused_gdr_dh
 
     cu = cp_context.cu_seqlens
@@ -188,7 +195,7 @@ def inter_card_cp_prepare_dhm(
 
     _, dh0_buffer = fused_gdr_dh(
         q=q, k=k, a=a, g=g, b=beta, do=do,
-        dht=None,
+        dht=dht,
         output_dh0=True,
         output_dh=False,
         scale=scale,
@@ -224,7 +231,7 @@ def inter_card_cp_correct_terminal_states(
     cp_context,
     state_v_first: bool = False,
 ):
-    assert not state_v_first, "单层 inter-card CP 暂只支持 state_v_first=False"
+
     from flash_qla.ops.gated_delta_rule.chunk import correct_terminal_states
 
     Hv = dS_buf.shape[1]
@@ -252,13 +259,14 @@ def inter_card_cp_preprocess_bwd(
     cp_context,
     state_v_first: bool = False,
     M_r_first: torch.Tensor | None = None,
+    dht: torch.Tensor | None = None,
 ):
     """返回本卡末序列的跨卡 incoming 终态梯度 `corrected_dht`（[N, Hv, K, V] fp32，仅 [N-1] 非零），
     末 rank 返回 None。
 
     M_r_first: 首序列的传递矩阵 [H, K, K]，由 forward 缓存。
     """
-    assert not state_v_first, "单层 inter-card CP 暂只支持 state_v_first=False"
+
 
     group = cp_context.group
     cu_cpu = cp_context.cu_seqlens_cpu.tolist()
@@ -270,6 +278,7 @@ def inter_card_cp_preprocess_bwd(
     dS_ext_r = inter_card_cp_prepare_dhm(
         q=q, k=k, v=v, a=a, g=g, beta=beta, do=do,
         scale=scale, cp_context=cp_context, state_v_first=state_v_first,
+        dht=dht,
     )
 
     dS_ext_r = dS_ext_r.float()
@@ -284,9 +293,15 @@ def inter_card_cp_preprocess_bwd(
         return None
 
     terminal_state_r = inter_card_cp_correct_terminal_states(
-        dS_buf=dS_buf, M_buf=M_buf, cp_context=cp_context, state_v_first=state_v_first,
+        dS_buf=dS_buf, M_buf=M_buf, cp_context=cp_context,
+        state_v_first=state_v_first,
     )
 
-    corrected_dht = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=k.device)
+    if state_v_first:
+        corrected_dht = torch.zeros((N, Hv, V, K), dtype=torch.float32, device=k.device)
+    else:
+        corrected_dht = torch.zeros((N, Hv, K, V), dtype=torch.float32, device=k.device)
     corrected_dht[N - 1] = terminal_state_r
+    if dht is not None and N > 1:
+        corrected_dht[:N - 1] = dht[:N - 1]
     return corrected_dht

@@ -32,6 +32,7 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
         g: torch.Tensor,
         beta: torch.Tensor,
         scale: float,
+        initial_state: torch.Tensor | None,
         state_v_first: bool,
         use_qk_l2norm_in_kernel: bool,
         output_final_state: bool,
@@ -52,7 +53,7 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
         raw_h0, M_r_first = inter_card_cp_preprocess_fwd(
             k=k, v=v, a=A, g=g, beta=beta,
             cp_context=cp_context, state_v_first=state_v_first,
-            output_mt_first=True,
+            output_mt_first=True, initial_state=initial_state,
         )
 
         o, _, final_state = fused_gdr_fwd(
@@ -75,6 +76,7 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
         ctx.cp_context = cp_context
         ctx.raw_h0 = raw_h0
         ctx.M_r_first = M_r_first
+        ctx.has_initial_state = initial_state is not None
         return o.to(q.dtype), final_state
 
     @staticmethod
@@ -99,18 +101,19 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
         M_r_first = ctx.M_r_first
 
         # 跨卡 backward 预处理：还原本卡末序列的 incoming 终态梯度
+        # dht 的影响通过 prepare_dhm(dht=dht) 传入末 rank 的 fused_gdr_dh，
+        # 使其 dS_ext 包含 dht 的贡献，scan 以 seed=0 传播到前面的 rank。
         corrected_dht = inter_card_cp_preprocess_bwd(
             q=q, k=k, v=v, a=A, g=g, beta=beta, do=do,
             scale=scale, cp_context=cp_context,
             state_v_first=state_v_first, M_r_first=M_r_first,
+            dht=dht,
         )
 
-        # 合并 autograd dht（final_state 的梯度）
-        if dht is not None:
-            if corrected_dht is None:
-                corrected_dht = dht
-            else:
-                corrected_dht[-1] = corrected_dht[-1] + dht[-1].float()
+        # 末 rank 的 corrected_dht 为 None（preprocess_bwd 跳过），
+        # 但 dht 仍需传给本地 fused_gdr_bwd
+        if dht is not None and corrected_dht is None:
+            corrected_dht = dht
 
         # 重算 h（forward 未保存 h，需以 raw_h0 为种子重算）
         h, _, _ = fused_gdr_h(
@@ -145,6 +148,12 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)
 
+        if ctx.has_initial_state:
+            if not cp_context.is_first_rank:
+                dh0[0] = 0
+        else:
+            dh0 = None
+
         return (
             dq.to(q),    # q
             dk.to(k),    # k
@@ -152,6 +161,7 @@ class CPChunkGatedDeltaRuleFunction(torch.autograd.Function):
             dg.to(g),    # g
             db.to(beta), # beta
             None,         # scale
+            dh0,          # initial_state
             None,         # state_v_first
             None,         # use_qk_l2norm_in_kernel
             None,         # output_final_state
