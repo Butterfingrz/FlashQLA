@@ -189,7 +189,7 @@ def tilelang_fused_chunk_gdr_fwd(
 
             PRODUCER_NREG = 32
             CONSUMER_V_NREG = 128
-            CONSUMER_S_NREG = 160
+            CONSUMER_S_NREG = 128
             CONSUMER_O_NREG = 128
 
             if tx < 128:
@@ -624,9 +624,10 @@ def tilelang_fused_chunk_gdr_fwd(
                             if seq_split_idx + j_s < seq_end_idx:
                                 o[batch_idx, seq_split_idx + j_s, bh, DV_start + j_v] = \
                                     o_shared[j_s, j_v]
-                            elif bb == batch_size - 1 and seq_split_idx + j_s < num_tokens:
-                                # For sglang padding
-                                o[batch_idx, seq_split_idx + j_s, bh, DV_start + j_v] = 0
+                        if bb == batch_size - 1:
+                            for j_s, j_v in T.Parallel(block_S, block_DV):
+                                if seq_end_idx + j_s < num_tokens:
+                                    o[batch_idx, seq_end_idx + j_s, bh, DV_start + j_v] = 0
 
     return tilelang_fused_chunk_gdr_fwd_kernel
 
@@ -683,10 +684,10 @@ def fused_gdr_fwd(
     else:
         is_cp = True
 
-    # Always use T.copy path to avoid T.clear bug for large fragments
-    use_initial_state = True
+    # use torch.empty() 
+    use_initial_state = initial_state is not None
     if initial_state is None:
-        initial_state = torch.zeros(
+        initial_state = torch.empty(
             (real_batch_size, H, V, K)
             if state_v_first
             else (real_batch_size, H, K, V),

@@ -205,7 +205,6 @@ def profile_gated_delta_rule(
     # Per-kernel breakdown (only when profiler captured events)
     has_fla_kernels = len(prof_fla) > 1  # more than just "total"
     has_qla_kernels = len(prof_qla) > 1
-
     if has_fla_kernels and has_qla_kernels:
         result_fla = {
             "[fwd] csum": _get(prof_fla, "chunk_local_cumsum_scalar_kernel"),
