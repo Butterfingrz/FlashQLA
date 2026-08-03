@@ -1,18 +1,5 @@
 # Copyright (c) 2026 The Qwen team, Alibaba Group.
 # Licensed under The MIT License [see LICENSE for details]
-"""单层 inter-card CP 真多卡验证（pytest 形式，内置 torch.multiprocessing.spawn）。
-
-    pytest tests/test_inter_cp.py -v
-
-每个用例在 pytest 进程内 spawn `WORLD_SIZE`(= min(max(device_count,2),4)) 个 worker 子进程，
-GPU 数不足时自动 skip。各 rank 用**同一 seed** 生成同一条全局序列，切自己的 token 片，
-用 build_cp_context 建上下文，走 chunk_gated_delta_rule(cp_context=...)；输出/梯度与**单卡**
-auto_cp=False golden 的对应片对齐（per-rank slice + all_reduce(MAX) ratio）。
-
-覆盖：前向 + 后向；output_final_state（末 rank 末序列 vs golden 末全局序列）；
-GQA(Hk<Hv)；state_v_first；initial_state(h0)；dht(loss 含 final_state)。
-"""
-
 import os
 
 import pytest
@@ -24,20 +11,17 @@ import torch.nn.functional as F
 from flash_qla.ops.gated_delta_rule import chunk_gated_delta_rule
 from flash_qla.ops.gated_delta_rule.chunk.cp import build_cp_context
 
-# ===== 可配置 =====
 RTOL = 1e-2
 SEED = 1234
 DTYPE = torch.bfloat16
-MASTER_PORT = "29531"  # 区别于 fla CP 测试的 29502
+MASTER_PORT = "29531"
 
-# 用可用 GPU 数决定 world_size（限制 [2, 4]）；不足时测试运行时 skip。
 WORLD_SIZE = min(max(torch.cuda.device_count(), 2), 4)
 
 
 def make_cases(W: int):
-    """根据 world_size W 生成测试用例，保证全局 token 总数能被 W 整除。"""
     base = 1024 * W
-    # (全局 cu_seqlens, Hk, Hv, g_scale, state_v_first, use_h0, use_dht)
+    # (cu_seqlens, Hk, Hv, g_scale, state_v_first, use_h0, use_dht)
     cases = [
         ([0, base], 8, 8, 1.0 / 16, False, False, False),
         ([0, base // 4, base * 3 // 4, base], 8, 8, 1.0 / 16, False, False, False),
@@ -74,11 +58,7 @@ CASES = make_cases(WORLD_SIZE)
 _CASE_IDS = [_case_id(c) for c in CASES]
 
 
-# =========================================
-# 对拍逻辑（各 rank 比自己 token 片 vs 单卡 golden 对应片；all_reduce(MAX) 得全局 ratio）
-# =========================================
 def run_case(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht, dev, rank, W, seed=SEED):
-    """前向：返回全局 (max_o_ratio, max_s_ratio)（all_reduce 后各 rank 一致）。"""
     T = cu_global[-1]
     K = V = 128
     N_seqs = len(cu_global) - 1
@@ -99,13 +79,11 @@ def run_case(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht, dev, ra
     else:
         h0 = None
 
-    # 单卡 golden
     o_ref, final_state_ref = chunk_gated_delta_rule(
         q, k, v, g, beta, scale=scale, cu_seqlens=cu_g,
         output_final_state=True, auto_cp=False, initial_state=h0,
         state_v_first=state_v_first)
 
-    # CP：本 rank token 片 [lo,hi)
     part = T // W
     lo, hi = rank * part, (rank + 1) * part
     ctx = build_cp_context(cu_g, group=dist.group.WORLD)
@@ -120,13 +98,11 @@ def run_case(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht, dev, ra
         scale=scale, cp_context=ctx, output_final_state=True, initial_state=local_h0,
         state_v_first=state_v_first)
 
-    # --- output 比较 ---
     ref_slice = o_ref[:, lo:hi]
     err = (o_loc.float() - ref_slice.float()).abs().max().item()
     ref_norm = ref_slice.float().abs().max().item()
     o_ratio = err / (ref_norm + 1e-30)
 
-    # --- final state 比较（仅末 rank 最后一个 local 序列 vs golden 最后一个全局序列）---
     s_ratio = 0.0
     if rank == W - 1 and final_state_loc is not None and final_state_ref is not None:
         fs_loc = final_state_loc[-1].float()
@@ -141,7 +117,6 @@ def run_case(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht, dev, ra
 
 
 def _generate_inputs(T, Hk, Hv, K, V, g_scale, dev, seed):
-    """生成一组输入张量（detached，不 requires_grad）。"""
     torch.manual_seed(seed)
     q = F.normalize(torch.randn(1, T, Hk, K, device=dev, dtype=DTYPE), p=2, dim=-1)
     k = F.normalize(torch.randn(1, T, Hk, K, device=dev, dtype=DTYPE), p=2, dim=-1)
@@ -152,7 +127,6 @@ def _generate_inputs(T, Hk, Hv, K, V, g_scale, dev, seed):
 
 
 def run_case_backward(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht, dev, rank, W, seed=SEED):
-    """后向：返回全局 max grad ratio（all_reduce 后各 rank 一致）。"""
     T = cu_global[-1]
     K = V = 128
     N_seqs = len(cu_global) - 1
@@ -170,7 +144,7 @@ def run_case_backward(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht
     else:
         h0 = None
 
-    # ---------- golden: 单卡 backward ----------
+    # ---------- golden: non-cp backward ----------
     q_ref, k_ref, v_ref, beta_ref, g_ref = _generate_inputs(T, Hk, Hv, K, V, g_scale, dev, seed)
     q_ref.requires_grad_(True)
     k_ref.requires_grad_(True)
@@ -214,7 +188,6 @@ def run_case_backward(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht
         loss_cp = loss_cp + fs_cp.float().sum()
     loss_cp.backward()
 
-    # ---------- 比较各梯度 ----------
     max_ratio = 0.0
     for name, ref_param, cp_param in [
         ("dq", q_ref, q_cp),
@@ -251,9 +224,6 @@ def run_case_backward(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht
     return t[0].item()
 
 
-# =========================================
-# 分布式起停 + spawn 驱动
-# =========================================
 def _init_distributed(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = MASTER_PORT
@@ -270,12 +240,9 @@ def _cleanup_distributed():
 
 
 def _cp_worker(rank, world_size, case):
-    """spawn 出的 worker：init dist → 跑 fwd + bwd 对拍 → 各 rank 用一致 ratio assert。"""
     try:
         _init_distributed(rank, world_size)
         dev = f"cuda:{rank}"
-        # all_reduce 后各 rank 拿到相同的全局 ratio，故所有 rank 断言一致（不会因只在 rank0
-        # 抛异常而导致其他 rank 卡在后续集合通信上）。
         o_ratio, s_ratio = run_case(*case, dev, rank, world_size)
         grad_ratio = run_case_backward(*case, dev, rank, world_size)
     finally:
@@ -296,10 +263,6 @@ def _run_cp_case(world_size, case):
         start_method="spawn",
     )
 
-
-# =========================================
-# pytest 用例：一个 case 一次 spawn，worker 内覆盖 fwd + bwd
-# =========================================
 @pytest.mark.gpu
 @pytest.mark.slow
 @pytest.mark.parametrize("case", CASES, ids=_CASE_IDS)
@@ -311,11 +274,6 @@ def test_inter_cp(case):
 
 @pytest.mark.parametrize("total, world_size", [(1000, 3), (1000, 7), (100, 3)])
 def test_inter_cp_indivisible_raises(total, world_size):
-    """全局 token 数不能被 world_size 整除时必须报错（而非静默丢弃尾部 token）。
-
-    走 `_calc_inter_cp_seqs` 的单进程模拟入口（显式 world_size/rank、group=None），
-    断言在任何设备操作前触发，故此用例纯 CPU、无需 GPU/dist。
-    """
     from flash_qla.ops.gated_delta_rule.chunk.cp import _calc_inter_cp_seqs
 
     assert total % world_size != 0, "test setup: total must be indivisible"
@@ -325,7 +283,6 @@ def test_inter_cp_indivisible_raises(total, world_size):
 
 
 def test_inter_cp_divisible_ok():
-    """可整除时正常构建 inter-card 上下文（纯 CPU 校验，无需 GPU）。"""
     from flash_qla.ops.gated_delta_rule.chunk.cp import _calc_inter_cp_seqs
 
     cu = torch.tensor([0, 1000], dtype=torch.int32)  # 1000 % 4 == 0
