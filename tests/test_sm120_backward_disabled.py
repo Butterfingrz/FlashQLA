@@ -5,7 +5,7 @@
 
 On SM120, only forward pass is supported. Any attempt to invoke the backward
 path — whether through the low-level ``chunk_gated_delta_rule_bwd`` API, the
-autograd ``.backward()`` path, or the CP ``intra_card_cp_preprocess_bwd``
+autograd ``.backward()`` path, or the CP ``intra_cp_preprocess_bwd``
 helper — must raise ``NotImplementedError`` with a clear message.
 """
 
@@ -172,8 +172,10 @@ def test_autograd_backward_raises_not_implemented():
 @pytest.mark.gpu
 @pytest.mark.sm120
 def test_cp_preprocess_bwd_raises_not_implemented():
-    """``intra_card_cp_preprocess_bwd`` must raise NotImplementedError on SM120."""
-    from flash_qla.ops.gated_delta_rule.chunk.cp_context import intra_card_cp_preprocess_bwd
+    """``intra_cp_preprocess_bwd`` must raise NotImplementedError on SM120."""
+    from flash_qla.ops.gated_delta_rule.chunk.cp import (
+        intra_cp_preprocess_bwd, build_intra_cp_context,
+    )
 
     q, k, v, g, beta, do, h0, dht, scale = _make_inputs(
         use_h0=True, state_v_first=False,
@@ -198,17 +200,21 @@ def test_cp_preprocess_bwd_raises_not_implemented():
         state_v_first=False,
     )
 
+    # Build the intra-card context explicitly, then invoke backward preprocess —
+    # it must raise NotImplementedError on SM120 (no fused_gdr_dh) regardless of use_cp.
+    cp_ctx = build_intra_cp_context(
+        None, k, v, A_qla.shape[-1], cu_seqlens=None, auto_cp=True, is_bwd=True,
+    )
     with pytest.raises(NotImplementedError) as exc_info:
-        intra_card_cp_preprocess_bwd(
+        intra_cp_preprocess_bwd(
+            cp_ctx,
             k=k, v=v, a=A_qla, g=g, b=beta,
             raw_h0=h0_ref,
             q=q, do=do, dht=dht_ref,
             scale=scale,
-            raw_cu_seqlens=None,
             state_v_first=False,
-            force_cp=1,
         )
-    _assert_not_implemented_error(exc_info, "intra_card_cp_preprocess_bwd")
+    _assert_not_implemented_error(exc_info, "intra_cp_preprocess_bwd")
 
 
 # ---------------------------------------------------------------------------

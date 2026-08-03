@@ -1,31 +1,37 @@
 # Copyright (c) 2026 The Qwen team, Alibaba Group.
 # Licensed under The MIT License [see LICENSE for details]
-"""单层 inter-card CP 真多卡验证（独立脚本，不污染 tests）。
+"""单层 inter-card CP 真多卡验证（pytest 形式，内置 torch.multiprocessing.spawn）。
 
-  torchrun --nproc_per_node=<N> test_gdr_inter_cp.py
+    pytest tests/test_inter_cp.py -v
 
-支持任意 GPU 数（要求全局 token 总数能被 GPU 数整除）。
-各 rank 用**同一 seed** 生成同一条全局序列，切自己的 token 片，用 build_cp_context 建上下文，
-走 chunk_gated_delta_rule(cp_context=...)；输出与**单卡** auto_cp=False golden 的对应片对齐。
-同时比较 output_final_state：末 rank 最后一个 local 序列的 final state 与 golden 的最后一个
-全局序列的 final state 对齐。
+每个用例在 pytest 进程内 spawn `WORLD_SIZE`(= min(max(device_count,2),4)) 个 worker 子进程，
+GPU 数不足时自动 skip。各 rank 用**同一 seed** 生成同一条全局序列，切自己的 token 片，
+用 build_cp_context 建上下文，走 chunk_gated_delta_rule(cp_context=...)；输出/梯度与**单卡**
+auto_cp=False golden 的对应片对齐（per-rank slice + all_reduce(MAX) ratio）。
 
-后向验证：各梯度（dq, dk, dv, dg, db）的对应片与单卡 golden 的梯度对齐。
+覆盖：前向 + 后向；output_final_state（末 rank 末序列 vs golden 末全局序列）；
+GQA(Hk<Hv)；state_v_first；initial_state(h0)；dht(loss 含 final_state)。
 """
 
 import os
 
+import pytest
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from flash_qla.ops.gated_delta_rule import chunk_gated_delta_rule
 from flash_qla.ops.gated_delta_rule.chunk.cp import build_cp_context
 
-# ===== 可配置（直接改这里做轻量调试）=====
+# ===== 可配置 =====
 RTOL = 1e-2
 SEED = 1234
 DTYPE = torch.bfloat16
+MASTER_PORT = "29531"  # 区别于 fla CP 测试的 29502
+
+# 用可用 GPU 数决定 world_size（限制 [2, 4]）；不足时测试运行时 skip。
+WORLD_SIZE = min(max(torch.cuda.device_count(), 2), 4)
 
 
 def make_cases(W: int):
@@ -52,15 +58,27 @@ def make_cases(W: int):
         ([0, base // 4, base * 3 // 4, base], 8, 8, 1.0 / 16, False, False, True),
         # combined: state_v_first + h0 + dht
         ([0, base], 8, 8, 1.0 / 16, True, True, True),
-        ([0, base // 2, base], 8, 8, 1.0 / 16, True, True, True)
+        ([0, base // 2, base], 8, 8, 1.0 / 16, True, True, True),
     ]
     return cases
 
 
+def _case_id(case) -> str:
+    cu, Hk, Hv, gs, svf, use_h0, use_dht = case
+    flags = "".join(f for f, on in [("vk", svf), ("h0", use_h0), ("dht", use_dht)] if on)
+    flags = f"-{flags}" if flags else ""
+    return f"n{len(cu) - 1}-Hk{Hk}Hv{Hv}-g{gs:g}{flags}"
+
+
+CASES = make_cases(WORLD_SIZE)
+_CASE_IDS = [_case_id(c) for c in CASES]
+
+
 # =========================================
-
-
+# 对拍逻辑（各 rank 比自己 token 片 vs 单卡 golden 对应片；all_reduce(MAX) 得全局 ratio）
+# =========================================
 def run_case(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht, dev, rank, W, seed=SEED):
+    """前向：返回全局 (max_o_ratio, max_s_ratio)（all_reduce 后各 rank 一致）。"""
     T = cu_global[-1]
     K = V = 128
     N_seqs = len(cu_global) - 1
@@ -119,17 +137,7 @@ def run_case(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht, dev, ra
 
     t = torch.tensor([o_ratio, s_ratio], device=dev)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    max_o_ratio, max_s_ratio = t[0].item(), t[1].item()
-    ok = max_o_ratio <= RTOL and max_s_ratio <= RTOL
-    if rank == 0:
-        flags = []
-        if state_v_first: flags.append("vk")
-        if use_h0: flags.append("h0")
-        if use_dht: flags.append("dht")
-        flag_str = f" [{','.join(flags)}]" if flags else ""
-        print(f"[{'PASS' if ok else 'FAIL'}] cu={cu_global} Hk/Hv={Hk}/{Hv} "
-              f"g×{g_scale:<7} o_ratio={max_o_ratio:.2e} s_ratio={max_s_ratio:.2e}{flag_str}")
-    return ok
+    return t[0].item(), t[1].item()
 
 
 def _generate_inputs(T, Hk, Hv, K, V, g_scale, dev, seed):
@@ -144,6 +152,7 @@ def _generate_inputs(T, Hk, Hv, K, V, g_scale, dev, seed):
 
 
 def run_case_backward(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht, dev, rank, W, seed=SEED):
+    """后向：返回全局 max grad ratio（all_reduce 后各 rank 一致）。"""
     T = cu_global[-1]
     K = V = 128
     N_seqs = len(cu_global) - 1
@@ -207,7 +216,6 @@ def run_case_backward(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht
 
     # ---------- 比较各梯度 ----------
     max_ratio = 0.0
-    worst_name = ""
     for name, ref_param, cp_param in [
         ("dq", q_ref, q_cp),
         ("dk", k_ref, k_cp),
@@ -220,9 +228,7 @@ def run_case_backward(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht
         err = (cp_grad - ref_grad).abs().max().item()
         ref_norm = ref_grad.abs().max().item()
         ratio = err / (ref_norm + 1e-30)
-        if ratio > max_ratio:
-            max_ratio = ratio
-            worst_name = name
+        max_ratio = max(max_ratio, ratio)
 
     if use_h0 and h0_ref is not None and local_h0_cp is not None:
         ref_grad = h0_ref.grad
@@ -238,77 +244,91 @@ def run_case_backward(cu_global, Hk, Hv, g_scale, state_v_first, use_h0, use_dht
                     continue
                 err = (cp_slice[si] - ref_slice[si]).abs().max().item()
                 ref_norm = ref_slice[si].abs().max().item()
-                ratio = err / (ref_norm + 1e-30)
-                if ratio > max_ratio:
-                    max_ratio = ratio
-                    worst_name = "dh0"
+                max_ratio = max(max_ratio, err / (ref_norm + 1e-30))
 
     t = torch.tensor([max_ratio], device=dev)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    max_ratio_all = t[0].item()
-    ok = max_ratio_all <= RTOL
-    if rank == 0:
-        flags = []
-        if state_v_first: flags.append("vk")
-        if use_h0: flags.append("h0")
-        if use_dht: flags.append("dht")
-        flag_str = f" [{','.join(flags)}]" if flags else ""
-        print(f"[{'PASS' if ok else 'FAIL'}] cu={cu_global} Hk/Hv={Hk}/{Hv} "
-              f"g×{g_scale:<7} grad_ratio={max_ratio_all:.2e} worst={worst_name}{flag_str}")
-    return ok
+    return t[0].item()
 
 
-def main():
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    W = dist.get_world_size()
-    local = int(os.environ.get("LOCAL_RANK", rank))
-    torch.cuda.set_device(local)
-    dev = f"cuda:{local}"
-
-    cases = make_cases(W)
-
-    # Forward 测试
-    if rank == 0:
-        print("=" * 80)
-        print(f"单层 inter-card CP 真 {W} 卡 前向 验证（vs 单卡 auto_cp=False golden，rtol={RTOL}）")
-        print("=" * 80)
-
-    fwd_results = []
-    for cu_global, Hk, Hv, gs, svf, h0, dht in cases:
-        fwd_results.append(run_case(cu_global, Hk, Hv, gs, svf, h0, dht, dev, rank, W))
-
-    if rank == 0:
-        n = sum(fwd_results)
-        print(f"前向：{n}/{len(fwd_results)} 通过")
-
-    # Backward 测试
-    if rank == 0:
-        print("=" * 80)
-        print(f"单层 inter-card CP 真 {W} 卡 后向 验证（vs 单卡 auto_cp=False golden，rtol={RTOL}）")
-        print("=" * 80)
-
-    bwd_results = []
-    for cu_global, Hk, Hv, gs, svf, h0, dht in cases:
-        torch.cuda.empty_cache()
-        bwd_results.append(run_case_backward(cu_global, Hk, Hv, gs, svf, h0, dht, dev, rank, W))
-
-    if rank == 0:
-        n_bwd = sum(bwd_results)
-        print(f"后向：{n_bwd}/{len(bwd_results)} 通过")
-
-    # 总结
-    if rank == 0:
-        print("-" * 80)
-        total = sum(fwd_results) + sum(bwd_results)
-        total_cases = len(fwd_results) + len(bwd_results)
-        print(f"总计 {total}/{total_cases} 通过")
-
-    dist.destroy_process_group()
-    all_pass = all(fwd_results) and all(bwd_results)
-    if rank == 0 and not all_pass:
-        raise SystemExit(1)
+# =========================================
+# 分布式起停 + spawn 驱动
+# =========================================
+def _init_distributed(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = MASTER_PORT
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 
-if __name__ == "__main__":
-    main()
+def _cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _cp_worker(rank, world_size, case):
+    """spawn 出的 worker：init dist → 跑 fwd + bwd 对拍 → 各 rank 用一致 ratio assert。"""
+    try:
+        _init_distributed(rank, world_size)
+        dev = f"cuda:{rank}"
+        # all_reduce 后各 rank 拿到相同的全局 ratio，故所有 rank 断言一致（不会因只在 rank0
+        # 抛异常而导致其他 rank 卡在后续集合通信上）。
+        o_ratio, s_ratio = run_case(*case, dev, rank, world_size)
+        grad_ratio = run_case_backward(*case, dev, rank, world_size)
+    finally:
+        _cleanup_distributed()
+
+    assert o_ratio <= RTOL and s_ratio <= RTOL and grad_ratio <= RTOL, (
+        f"inter-CP mismatch (rank {rank}): case={case} "
+        f"o_ratio={o_ratio:.2e} s_ratio={s_ratio:.2e} grad_ratio={grad_ratio:.2e} (rtol={RTOL})"
+    )
+
+
+def _run_cp_case(world_size, case):
+    mp.start_processes(
+        _cp_worker,
+        args=(world_size, case),
+        nprocs=world_size,
+        join=True,
+        start_method="spawn",
+    )
+
+
+# =========================================
+# pytest 用例：一个 case 一次 spawn，worker 内覆盖 fwd + bwd
+# =========================================
+@pytest.mark.gpu
+@pytest.mark.slow
+@pytest.mark.parametrize("case", CASES, ids=_CASE_IDS)
+def test_inter_cp(case):
+    if torch.cuda.device_count() < WORLD_SIZE:
+        pytest.skip(f"inter-card CP test requires >= {WORLD_SIZE} GPUs")
+    _run_cp_case(WORLD_SIZE, case)
+
+
+@pytest.mark.parametrize("total, world_size", [(1000, 3), (1000, 7), (100, 3)])
+def test_inter_cp_indivisible_raises(total, world_size):
+    """全局 token 数不能被 world_size 整除时必须报错（而非静默丢弃尾部 token）。
+
+    走 `_calc_inter_cp_seqs` 的单进程模拟入口（显式 world_size/rank、group=None），
+    断言在任何设备操作前触发，故此用例纯 CPU、无需 GPU/dist。
+    """
+    from flash_qla.ops.gated_delta_rule.chunk.cp import _calc_inter_cp_seqs
+
+    assert total % world_size != 0, "test setup: total must be indivisible"
+    cu = torch.tensor([0, total], dtype=torch.int32)
+    with pytest.raises(AssertionError, match="divisible by"):
+        _calc_inter_cp_seqs(cu, world_size=world_size, rank=0, group=None)
+
+
+def test_inter_cp_divisible_ok():
+    """可整除时正常构建 inter-card 上下文（纯 CPU 校验，无需 GPU）。"""
+    from flash_qla.ops.gated_delta_rule.chunk.cp import _calc_inter_cp_seqs
+
+    cu = torch.tensor([0, 1000], dtype=torch.int32)  # 1000 % 4 == 0
+    ctx = _calc_inter_cp_seqs(cu, world_size=4, rank=0, group=None)
+    assert ctx.type == "inter"
+    assert ctx.num_seqs >= 1

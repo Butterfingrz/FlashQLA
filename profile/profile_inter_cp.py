@@ -35,17 +35,17 @@ from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
 from flash_qla.ops.gated_delta_rule.chunk import (
     kkt_solve, fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, fused_gdr_dh, CHUNK_SIZE,
 )
-from flash_qla.ops.gated_delta_rule.chunk.cp import (
-    build_cp_context,
+from flash_qla.ops.gated_delta_rule.chunk.cp import build_cp_context
+from flash_qla.ops.gated_delta_rule.chunk.cp.comm import (
+    all_gather_into_tensor, pack_hm, unpack_hm,
+)
+from cp_stages import (
     inter_card_cp_prepare_hm,
     inter_card_cp_all_gather_hm,
     inter_card_cp_correct_initial_states,
     inter_card_cp_prepare_dhm,
     inter_card_cp_all_gather_dhm,
     inter_card_cp_correct_terminal_states,
-)
-from flash_qla.ops.gated_delta_rule.chunk.cp.comm import (
-    all_gather_into_tensor, pack_hm, unpack_hm,
 )
 
 CHUNK = 64
