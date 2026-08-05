@@ -4,6 +4,7 @@ from .context import (
     FlashQLACPContext,
     build_cp_context,
     build_intra_cp_context,
+    build_inter_intra_cp_context,
     _calc_inter_cp_seqs,
     _calc_intra_cp_seqs,
     _create_cu_seqlens,
@@ -17,6 +18,8 @@ from .preprocess import (
     inter_cp_preprocess_bwd,
     intra_cp_preprocess_fwd,
     intra_cp_preprocess_bwd,
+    inter_intra_cp_preprocess_fwd,
+    inter_intra_cp_preprocess_bwd,
 )
 
 __all__ = [
@@ -24,6 +27,7 @@ __all__ = [
     "FlashQLACPContext",
     "build_cp_context",
     "build_intra_cp_context",
+    "build_inter_intra_cp_context",
     "_calc_inter_cp_seqs",
     "_calc_intra_cp_seqs",
     "_create_cu_seqlens",
@@ -40,4 +44,6 @@ __all__ = [
     "inter_cp_preprocess_bwd",
     "intra_cp_preprocess_fwd",
     "intra_cp_preprocess_bwd",
+    "inter_intra_cp_preprocess_fwd",
+    "inter_intra_cp_preprocess_bwd",
 ]

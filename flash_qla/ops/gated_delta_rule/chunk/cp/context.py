@@ -51,14 +51,19 @@ class FlashQLACPContext:
 
     # --- intra-card ---
     use_intra_cp: bool = False
-    intra_cp_cu_seqlens: torch.Tensor | None = None 
+    intra_cp_cu_seqlens: torch.Tensor | None = None
     seq_map_r2c: torch.Tensor | None = None
     seq_map_c2r: torch.Tensor | None = None
     ht_mask: torch.Tensor | None = None
     ht_mask_bwd: torch.Tensor | None = None
 
+    # --- inter+intra full-fallback warmup (precomputed; pure function of the
+    # intra partition, so no per-step warmup kernel is needed) ---
+    intra_num_warmup: torch.Tensor | None = None
+    intra_fallback: torch.Tensor | None = None
+
     def copy_for_backward(self) -> "FlashQLACPContext":
-        return FlashQLACPContext(
+        copied = FlashQLACPContext(
             type=self.type,
             group=self.group,
             cu_seqlens=self.cu_seqlens.clone() if self.cu_seqlens is not None else None,
@@ -70,6 +75,23 @@ class FlashQLACPContext:
             conv1d_kernel_size=self.conv1d_kernel_size,
             pre_num_conv_tokens=self.pre_num_conv_tokens,
         )
+        # inter_intra additionally carries the intra-level partition tensors.
+        if self.type == "inter_intra":
+            copied.use_intra_cp = self.use_intra_cp
+            copied.intra_cp_cu_seqlens = (
+                self.intra_cp_cu_seqlens.clone() if self.intra_cp_cu_seqlens is not None else None
+            )
+            copied.seq_map_r2c = self.seq_map_r2c.clone() if self.seq_map_r2c is not None else None
+            copied.seq_map_c2r = self.seq_map_c2r.clone() if self.seq_map_c2r is not None else None
+            copied.ht_mask = self.ht_mask.clone() if self.ht_mask is not None else None
+            copied.ht_mask_bwd = self.ht_mask_bwd.clone() if self.ht_mask_bwd is not None else None
+            copied.intra_num_warmup = (
+                self.intra_num_warmup.clone() if self.intra_num_warmup is not None else None
+            )
+            copied.intra_fallback = (
+                self.intra_fallback.clone() if self.intra_fallback is not None else None
+            )
+        return copied
 
     @property
     def num_seqs(self) -> int:
@@ -82,6 +104,10 @@ class FlashQLACPContext:
     @property
     def is_intra_cp_enabled(self) -> bool:
         return self.type == "intra" and self.use_intra_cp
+
+    @property
+    def is_inter_intra_cp_enabled(self) -> bool:
+        return self.type == "inter_intra"
 
     def get_fwd_scan_tensors(self, num_v_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
         dev_idx = self.cu_seqlens.device.index
@@ -317,6 +343,96 @@ def build_intra_cp_context(
         num_v_heads=num_v_heads,
         is_bwd=is_bwd,
     )
+
+
+# ---------------------------------------------------------------------------
+# build inter+intra-card context (inter across cards, intra within each card)
+# ---------------------------------------------------------------------------
+def build_inter_intra_cp_context(
+    cu_seqlens: torch.Tensor,
+    group: "ProcessGroup",
+    v: torch.Tensor,
+    chunk_size: int,
+    num_v_heads: int | None = None,
+    conv1d_kernel_size: int | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+    is_bwd: bool = False,
+) -> "FlashQLACPContext":
+    """Compose an inter-card split (across ranks) with an intra-card split (within
+    each rank's local sequence). Reuses the two standalone builders unchanged and
+    merges their disjoint field groups into one ``type="inter_intra"`` context.
+    """
+    if num_v_heads is None:
+        num_v_heads = v.shape[2]
+
+    # Step 1: inter split -> per-card local cu_seqlens + rank topology.
+    inter_ctx = _calc_inter_cp_seqs(
+        cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        group=group,
+        conv1d_kernel_size=conv1d_kernel_size,
+    )
+
+    # Step 2: intra split over this card's *local* raw cu_seqlens.
+    intra_ctx = _calc_intra_cp_seqs(
+        raw_cu_seqlens=inter_ctx.cu_seqlens,
+        chunk_size=chunk_size,
+        num_v_heads=num_v_heads,
+        is_bwd=is_bwd,
+    )
+
+    # Step 3: precompute the full-fallback warmup/mask. The inter+intra path forgoes
+    # the g-dependent warmup optimization (every cp sub-chunk is fully corrected), so
+    # these are a pure function of the static intra partition — compute once here
+    # instead of launching a warmup kernel every step.
+    intra_num_warmup, intra_fallback = (None, None)
+    if intra_ctx.use_intra_cp:
+        intra_num_warmup, intra_fallback = _calc_full_fallback_warmup(
+            intra_ctx.intra_cp_cu_seqlens, chunk_size, num_v_heads,
+        )
+
+    return FlashQLACPContext(
+        type="inter_intra",
+        # common / inter fields (local card sequence + rank topology)
+        cu_seqlens=inter_ctx.cu_seqlens,
+        group=inter_ctx.group,
+        cu_seqlens_cpu=inter_ctx.cu_seqlens_cpu,
+        is_last_rank=inter_ctx.is_last_rank,
+        pre_num_ranks=inter_ctx.pre_num_ranks,
+        is_first_rank=inter_ctx.is_first_rank,
+        post_num_ranks=inter_ctx.post_num_ranks,
+        conv1d_kernel_size=inter_ctx.conv1d_kernel_size,
+        pre_num_conv_tokens=inter_ctx.pre_num_conv_tokens,
+        # intra fields (chunk sub-partition of the local sequence)
+        use_intra_cp=intra_ctx.use_intra_cp,
+        intra_cp_cu_seqlens=intra_ctx.intra_cp_cu_seqlens,
+        seq_map_r2c=intra_ctx.seq_map_r2c,
+        seq_map_c2r=intra_ctx.seq_map_c2r,
+        ht_mask=intra_ctx.ht_mask,
+        ht_mask_bwd=intra_ctx.ht_mask_bwd,
+        intra_num_warmup=intra_num_warmup,
+        intra_fallback=intra_fallback,
+    )
+
+
+@tensor_cache
+def _calc_full_fallback_warmup(
+    cp_cu_seqlens: torch.Tensor,
+    chunk_size: int,
+    num_v_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Full-fallback warmup for inter+intra: every cp sub-chunk is warmed up over
+    its whole length and always corrected. ``num_warmup[i] = ceil(len_i/chunk_size)``,
+    broadcast over heads; ``fallback`` is all-True. Pure function of the partition."""
+    lens = torch.diff(cp_cu_seqlens)
+    num_iters = (lens + chunk_size - 1) // chunk_size
+    num_warmup = (
+        num_iters.to(cp_cu_seqlens.dtype).unsqueeze(1).expand(-1, num_v_heads).contiguous()
+    )
+    fallback = torch.ones(
+        (cp_cu_seqlens.shape[0] - 1, num_v_heads), dtype=torch.bool, device=cp_cu_seqlens.device
+    )
+    return num_warmup, fallback
 
 
 # ---------------------------------------------------------------------------

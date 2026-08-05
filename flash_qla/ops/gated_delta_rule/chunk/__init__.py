@@ -9,17 +9,17 @@ from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
 
 if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
     from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
-    from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
+    from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
     from .hopper.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 64
 elif tilelang.contrib.nvcc.get_target_compute_version() in ["10.0", "10.3"]:
     from .blackwell import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
-    from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
+    from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 64
 elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
     from .blackwell_sm120 import fused_gdr_fwd, fused_gdr_h, kkt_solve
-    from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
+    from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
     fused_gdr_bwd = None
     fused_gdr_dh = None
     CHUNK_SIZE = 32
@@ -70,6 +70,12 @@ def chunk_gated_delta_rule_fwd(
         state_v_first=state_v_first,
         enable_fwd_cp_cache=enable_fwd_cp_cache,
     )
+    # Both standalone intra and combined inter+intra run the main kernel over the
+    # local intra-chunk partition; inter (and degenerate inter+intra) use the raw
+    # local cu_seqlens.
+    use_intra_layout = cp_context.is_intra_cp_enabled or (
+        cp_context.is_inter_intra_cp_enabled and cp_context.use_intra_cp
+    )
     o, h, final_state = fused_gdr_fwd(
         q=q,
         k=k,
@@ -82,7 +88,7 @@ def chunk_gated_delta_rule_fwd(
         output_final_state=output_final_state,
         output_h=output_h,
         output_o=True,
-        cu_seqlens=cp_context.intra_cp_cu_seqlens if cp_context.is_intra_cp_enabled else cp_context.cu_seqlens,
+        cu_seqlens=cp_context.intra_cp_cu_seqlens if use_intra_layout else cp_context.cu_seqlens,
         cp_seq_map=cp_context.seq_map_c2r,
         raw_cu_seqlens=cp_context.cu_seqlens,
         state_v_first=state_v_first,
@@ -126,18 +132,21 @@ def chunk_gated_delta_rule_bwd(
         cp_cache=cp_cache,
     )
 
+    use_intra_layout = cp_context.is_intra_cp_enabled or (
+        cp_context.is_inter_intra_cp_enabled and cp_context.use_intra_cp
+    )
     h, _, _ = fused_gdr_h(
         k=k, v=v, a=A, g=g, b=beta,
         initial_state=h0,
         output_final_state=False,
         output_h=True,
-        cu_seqlens=cp_context.intra_cp_cu_seqlens if cp_context.is_intra_cp_enabled else cp_context.cu_seqlens,
+        cu_seqlens=cp_context.intra_cp_cu_seqlens if use_intra_layout else cp_context.cu_seqlens,
         state_v_first=state_v_first,
     )
     dq, dk, dv, dg, db, dh0 = fused_gdr_bwd(
         q=q, k=k, v=v, a=A, g=g, b=beta,
         do=do, dht=dht, h=h, scale=scale,
-        cu_seqlens=cp_context.intra_cp_cu_seqlens if cp_context.is_intra_cp_enabled else cp_context.cu_seqlens,
+        cu_seqlens=cp_context.intra_cp_cu_seqlens if use_intra_layout else cp_context.cu_seqlens,
         state_v_first=state_v_first,
     )
 
@@ -355,7 +364,9 @@ def chunk_gated_delta_rule(
         "num_qk_heads must be divisible to num_v_heads."
     )
 
-    is_inter = cp_context is not None and cp_context.is_inter_cp_enabled
+    is_inter = cp_context is not None and (
+        cp_context.is_inter_cp_enabled or cp_context.is_inter_intra_cp_enabled
+    )
     if is_inter and q.shape[0] != 1:
         raise ValueError("inter-card CP requires B==1 (varlen).")
 

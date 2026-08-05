@@ -278,8 +278,27 @@ def tilelang_correct_h0(
     state_v_first,
     reverse: bool = False,
     transpose_m: bool = False,
+    write_entering: bool = True,
+    write_exiting: bool = False,
+    compute_m: bool = False,
     block_DV: int = 32,
 ):
+    """Unified state-correction scan.
+
+    A single scan over each raw sequence's chunks carries the running state
+    ``h_fragment``. Compile-time flags select the outputs:
+
+    - ``write_entering`` (correct mode): write the *entering* state of every chunk
+      to ``cp_h0`` — the standard correction used by intra/inter CP.
+    - ``write_exiting`` (aggregate mode): write only the post-last-chunk *exiting*
+      state to ``s_card`` (one per raw seq) — the card-level S* aggregate.
+    - ``compute_m``: additionally accumulate the ordered chunk-M product and write
+      ``m_card`` (one per raw seq). Only the ``bv == 0`` CTA does this (M is
+      ``[K,K]``, independent of the DV tiling); the accumulator is allocated only
+      when this flag is on, so ``compute_m=False`` compiles identically to before.
+
+    ``correct`` and ``aggregate`` (including the M product) thus share one scan body.
+    """
     cp_batch_size = T.dynamic("cp_batch_size")
     raw_batch_size = T.dynamic("raw_batch_size")
     state_shape = (
@@ -292,58 +311,46 @@ def tilelang_correct_h0(
         if state_v_first
         else (raw_batch_size, H, DK, DV)
     )
+    tile_shape = (block_DV, DK) if state_v_first else (DK, block_DV)
 
     @T.macro
-    def kernel_body(
-        bb,
-        bh,
-        bv,
-        seq_start_idx,
-        seq_end_idx,
-        num_iters,
-        ht_buffer,
-        mt_buffer,
-        fallback_mask,
-        seq_map_r2c,
-        cp_h0,
-        h_fragment,
+    def scan_body(
+        bb, bh, bv, seq_start_idx, seq_end_idx, num_iters,
+        ht_buffer, mt_buffer, fallback_mask,
+        cp_h0, s_card, m_card, h_fragment,
     ):
-        h_shared = T.alloc_shared(
-            (block_DV, DK) if state_v_first else (DK, block_DV),
-            dtype=buffer_dtype,
-        )
-        hd_shared = T.alloc_shared(
-            (block_DV, DK) if state_v_first else (DK, block_DV),
-            dtype=buffer_dtype,
-        )
+        # cp_h0 / s_card / m_card that a given mode does not write are passed a
+        # valid same-typed placeholder tensor; the flags below gate every access,
+        # so placeholders are never touched.
+        h_shared = T.alloc_shared(tile_shape, dtype=buffer_dtype)
+        hd_shared = T.alloc_shared(tile_shape, dtype=buffer_dtype)
         m_shared = T.alloc_shared((DK, DK), dtype=buffer_dtype)
-
         DV_start = bv * block_DV
         DV_end = (bv + 1) * block_DV
 
-        for i_s in T.Pipelined(num_iters - 1, num_stages=2):
-            idx = seq_start_idx + num_iters - 1 - i_s if reverse else seq_start_idx + i_s
+        if compute_m:
+            mrun_shared = T.alloc_shared((DK, DK), dtype=buffer_dtype)
+            mrun_frag = T.alloc_fragment((DK, DK), dtype=accum_dtype)
+            if bv == 0:
+                for i, j in T.Parallel(DK, DK):
+                    if i == j:
+                        mrun_frag[i, j] = 1.0
+                    else:
+                        mrun_frag[i, j] = 0.0
+                T.copy(mrun_frag, mrun_shared)
+
+        for i_s in T.serial(num_iters):
+            idx = seq_end_idx - 1 - i_s if reverse else seq_start_idx + i_s
+            if write_entering:
+                # entering state of chunk idx (before this chunk's update)
+                if state_v_first:
+                    T.copy(h_fragment, cp_h0[idx, bh, DV_start:DV_end, 0:DK])
+                else:
+                    T.copy(h_fragment, cp_h0[idx, bh, 0:DK, DV_start:DV_end])
             if state_v_first:
-                T.copy(
-                    h_fragment,
-                    cp_h0[idx, bh, DV_start:DV_end, 0:DK],
-                )
+                T.copy(ht_buffer[idx, bh, DV_start:DV_end, 0:DK], h_shared)
             else:
-                T.copy(
-                    h_fragment,
-                    cp_h0[idx, bh, 0:DK, DV_start:DV_end],
-                )
-            if state_v_first:
-                T.copy(
-                    ht_buffer[idx, bh, DV_start:DV_end, 0:DK],
-                    h_shared,
-                )
-            else:
-                T.copy(
-                    ht_buffer[idx, bh, 0:DK, DV_start:DV_end],
-                    h_shared,
-                )
-            # TODO: manually WASP
+                T.copy(ht_buffer[idx, bh, 0:DK, DV_start:DV_end], h_shared)
             T.copy(mt_buffer[idx, bh, 0:DK, 0:DK], m_shared)
             if fallback_mask[idx, bh]:
                 T.copy(h_fragment, hd_shared)
@@ -359,21 +366,76 @@ def tilelang_correct_h0(
                         T.gemm(m_shared, hd_shared, h_fragment, transpose_A=True, clear_accum=False)
                     else:
                         T.gemm(m_shared, hd_shared, h_fragment, clear_accum=False)
+            if compute_m:
+                if bv == 0:
+                    # M_running := M_idx @ M_running (reset to 0 on fallback=False)
+                    if fallback_mask[idx, bh]:
+                        T.clear(mrun_frag)
+                        T.gemm(m_shared, mrun_shared, mrun_frag, clear_accum=True)
+                        T.copy(mrun_frag, mrun_shared)
+                    else:
+                        T.clear(mrun_shared)
 
-        last_idx = seq_start_idx if reverse else seq_start_idx + num_iters - 1
-        if state_v_first:
-            T.copy(
-                h_fragment,
-                cp_h0[last_idx, bh, DV_start:DV_end, 0:DK],
-            )
+        if write_exiting:
+            # post-last-chunk exiting state = card-level S*
+            if state_v_first:
+                T.copy(h_fragment, s_card[bb, bh, DV_start:DV_end, 0:DK])
+            else:
+                T.copy(h_fragment, s_card[bb, bh, 0:DK, DV_start:DV_end])
+        if compute_m:
+            if bv == 0:
+                T.copy(mrun_shared, m_card[bb, bh, 0:DK, 0:DK])
+
+    def _grid_prologue(bbhv, seq_map_r2c):
+        bbh, bv = bbhv // T.ceildiv(DV, block_DV), bbhv % T.ceildiv(DV, block_DV)
+        bb, bh = bbh // H, bbh % H
+        seq_start_idx = T.alloc_var("int32")
+        seq_end_idx = T.alloc_var("int32")
+        num_iters = T.alloc_var("int32")
+        seq_start_idx = seq_map_r2c[bb]
+        seq_end_idx = seq_map_r2c[bb + 1]
+        num_iters = seq_end_idx - seq_start_idx
+        return bb, bh, bv, seq_start_idx, seq_end_idx, num_iters
+
+    grid = T.ceildiv(DV, block_DV) * H * raw_batch_size
+
+    if write_exiting:
+        # aggregate mode: seed 0, output s_card (+ optional m_card). cp_h0 slot uses
+        # ht_buffer as a never-written placeholder.
+        if compute_m:
+            @T.prim_func
+            def tilelang_correct_h0_kernel(
+                ht_buffer: T.Tensor(state_shape, dtype=buffer_dtype),
+                mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=buffer_dtype),
+                fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
+                seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
+                s_card: T.Tensor(raw_state_shape, dtype=res_dtype),
+                m_card: T.Tensor([raw_batch_size, H, DK, DK], dtype=res_dtype),
+            ):
+                with T.Kernel(grid, threads=128) as (bbhv,):
+                    bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
+                    h_fragment = T.alloc_fragment(tile_shape, dtype=accum_dtype)
+                    T.clear(h_fragment)
+                    scan_body(bb, bh, bv, s0, s1, ni, ht_buffer, mt_buffer,
+                              fallback_mask, ht_buffer, s_card, m_card, h_fragment)
         else:
-            T.copy(
-                h_fragment,
-                cp_h0[last_idx, bh, 0:DK, DV_start:DV_end],
-            )
+            @T.prim_func
+            def tilelang_correct_h0_kernel(
+                ht_buffer: T.Tensor(state_shape, dtype=buffer_dtype),
+                mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=buffer_dtype),
+                fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
+                seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
+                s_card: T.Tensor(raw_state_shape, dtype=res_dtype),
+            ):
+                with T.Kernel(grid, threads=128) as (bbhv,):
+                    bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
+                    h_fragment = T.alloc_fragment(tile_shape, dtype=accum_dtype)
+                    T.clear(h_fragment)
+                    scan_body(bb, bh, bv, s0, s1, ni, ht_buffer, mt_buffer,
+                              fallback_mask, ht_buffer, s_card, mt_buffer, h_fragment)
 
-    if use_raw_h0:
-
+    elif use_raw_h0:
+        # correct mode with a raw_h0 seed. s_card / m_card slots use placeholders.
         @T.prim_func
         def tilelang_correct_h0_kernel(
             raw_h0: T.Tensor(raw_state_shape, dtype=res_dtype),
@@ -383,54 +445,18 @@ def tilelang_correct_h0(
             seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
             cp_h0: T.Tensor(state_shape, dtype=res_dtype),
         ):
-            with T.Kernel(
-                T.ceildiv(DV, block_DV) * H * raw_batch_size, threads=128
-            ) as (bbhv,):
-                bbh, bv = (
-                    bbhv // T.ceildiv(DV, block_DV),
-                    bbhv % T.ceildiv(DV, block_DV),
-                )
-                bb, bh = bbh // H, bbh % H
-
-                seq_start_idx = T.alloc_var("int32")
-                seq_end_idx = T.alloc_var("int32")
-                num_iters = T.alloc_var("int32")
-                seq_start_idx = seq_map_r2c[bb]
-                seq_end_idx = seq_map_r2c[bb + 1]
-                num_iters = seq_end_idx - seq_start_idx
-
-                h_fragment = T.alloc_fragment(
-                    (block_DV, DK) if state_v_first else (DK, block_DV),
-                    dtype=accum_dtype,
-                )
+            with T.Kernel(grid, threads=128) as (bbhv,):
+                bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
+                h_fragment = T.alloc_fragment(tile_shape, dtype=accum_dtype)
                 if state_v_first:
-                    T.copy(
-                        raw_h0[bb, bh, bv * block_DV : (bv + 1) * block_DV, 0:DK],
-                        h_fragment,
-                    )
+                    T.copy(raw_h0[bb, bh, bv * block_DV:(bv + 1) * block_DV, 0:DK], h_fragment)
                 else:
-                    T.copy(
-                        raw_h0[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV],
-                        h_fragment,
-                    )
-
-                kernel_body(
-                    bb,
-                    bh,
-                    bv,
-                    seq_start_idx,
-                    seq_end_idx,
-                    num_iters,
-                    ht_buffer,
-                    mt_buffer,
-                    fallback_mask,
-                    seq_map_r2c,
-                    cp_h0,
-                    h_fragment,
-                )
+                    T.copy(raw_h0[bb, bh, 0:DK, bv * block_DV:(bv + 1) * block_DV], h_fragment)
+                scan_body(bb, bh, bv, s0, s1, ni, ht_buffer, mt_buffer,
+                          fallback_mask, cp_h0, ht_buffer, mt_buffer, h_fragment)
 
     else:
-
+        # correct mode, zero seed.
         @T.prim_func
         def tilelang_correct_h0_kernel(
             ht_buffer: T.Tensor(state_shape, dtype=buffer_dtype),
@@ -439,42 +465,12 @@ def tilelang_correct_h0(
             seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
             cp_h0: T.Tensor(state_shape, dtype=res_dtype),
         ):
-            with T.Kernel(
-                T.ceildiv(DV, block_DV) * H * raw_batch_size, threads=128
-            ) as (bbhv,):
-                bbh, bv = (
-                    bbhv // T.ceildiv(DV, block_DV),
-                    bbhv % T.ceildiv(DV, block_DV),
-                )
-                bb, bh = bbh // H, bbh % H
-
-                seq_start_idx = T.alloc_var("int32")
-                seq_end_idx = T.alloc_var("int32")
-                num_iters = T.alloc_var("int32")
-                seq_start_idx = seq_map_r2c[bb]
-                seq_end_idx = seq_map_r2c[bb + 1]
-                num_iters = seq_end_idx - seq_start_idx
-
-                h_fragment = T.alloc_fragment(
-                    (block_DV, DK) if state_v_first else (DK, block_DV),
-                    dtype=accum_dtype,
-                )
+            with T.Kernel(grid, threads=128) as (bbhv,):
+                bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
+                h_fragment = T.alloc_fragment(tile_shape, dtype=accum_dtype)
                 T.clear(h_fragment)
-
-                kernel_body(
-                    bb,
-                    bh,
-                    bv,
-                    seq_start_idx,
-                    seq_end_idx,
-                    num_iters,
-                    ht_buffer,
-                    mt_buffer,
-                    fallback_mask,
-                    seq_map_r2c,
-                    cp_h0,
-                    h_fragment,
-                )
+                scan_body(bb, bh, bv, s0, s1, ni, ht_buffer, mt_buffer,
+                          fallback_mask, cp_h0, ht_buffer, mt_buffer, h_fragment)
 
     return tilelang_correct_h0_kernel
 
@@ -607,3 +603,75 @@ def correct_terminal_states(
         )
 
     return cp_dht
+
+
+# ---------------------------------------------------------------------------
+# card-level (S*, M) aggregation for inter+intra CP
+# ---------------------------------------------------------------------------
+def aggregate_card_state(
+    ht_buffer: torch.Tensor,   # [cp_batch_size, H, K, V] (or [.., V, K])
+    mt_buffer: torch.Tensor,   # [cp_batch_size, H, K, K]
+    fallback_mask: torch.Tensor,  # [cp_batch_size, H]
+    seq_map_r2c: torch.Tensor,  # [raw_batch_size + 1]
+    state_v_first: bool = False,
+    reverse: bool = False,
+    transpose_m: bool = False,
+    compute_m: bool = True,
+):
+    """Aggregate per-intra-chunk (S*, M) into per-raw-seq card-level (S*_card, M_card).
+
+    Returns ``(s_card, m_card)`` in float32. ``s_card`` has the same layout as
+    ``ht_buffer`` but with ``raw_batch_size`` leading dim; ``m_card`` is
+    ``[raw_batch_size, H, K, K]``. When ``compute_m`` is True the M product is
+    computed *inside* the state scan (single fused kernel launch); when False
+    (backward dS aggregate, which reuses the forward M_card), only ``s_card`` is
+    produced and ``m_card`` is ``None``.
+
+    ``reverse``/``transpose_m`` mirror ``correct_terminal_states`` for the backward
+    dS* aggregate.
+    """
+    raw_batch_size = seq_map_r2c.shape[0] - 1
+    _, num_heads, dim_2, dim_3 = ht_buffer.shape
+    if state_v_first:
+        v_head_dim, k_head_dim = dim_2, dim_3
+    else:
+        k_head_dim, v_head_dim = dim_2, dim_3
+    assert k_head_dim == v_head_dim == 128
+
+    res_dtype = torch.float32
+
+    state_kernel = tilelang_correct_h0(
+        H=num_heads,
+        DK=k_head_dim,
+        DV=v_head_dim,
+        res_dtype=res_dtype,
+        accum_dtype="float32",
+        buffer_dtype=ht_buffer.dtype,
+        seqlen_dtype=seq_map_r2c.dtype,
+        mask_dtype=fallback_mask.dtype,
+        use_raw_h0=False,
+        state_v_first=state_v_first,
+        reverse=reverse,
+        transpose_m=transpose_m,
+        write_entering=False,
+        write_exiting=True,
+        compute_m=compute_m,
+    )
+    s_card = torch.empty(
+        (raw_batch_size, num_heads, v_head_dim, k_head_dim)
+        if state_v_first
+        else (raw_batch_size, num_heads, k_head_dim, v_head_dim),
+        dtype=res_dtype,
+        device=ht_buffer.device,
+    )
+    if compute_m:
+        m_card = torch.empty(
+            (raw_batch_size, num_heads, k_head_dim, k_head_dim),
+            dtype=res_dtype,
+            device=mt_buffer.device,
+        )
+        state_kernel(ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, s_card, m_card)
+        return s_card, m_card
+
+    state_kernel(ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, s_card)
+    return s_card, None
