@@ -11,7 +11,6 @@ from flash_qla.utils import prepare_chunk_offsets
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
     },
 )
 def tilelang_prepare_dh_ws(
