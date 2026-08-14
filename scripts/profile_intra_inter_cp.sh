@@ -5,7 +5,7 @@ export NCCL_DEBUG=WARN
 #     --fla
 
 torchrun --nproc_per_node=4 --master_port=29500 profile/profile_inter_intra_cp.py \
-    --seqlen 65536 \
+    --seqlen 32768 \
     --nvh 32 \
     --nkh 32 \
-    --cu-seqlens 0-65536
+    --cu-seqlens 0-32768

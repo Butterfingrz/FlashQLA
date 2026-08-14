@@ -5,7 +5,7 @@
 对比三种模式（同一 rank-local 切片上）：
   - intra:      单卡内 intra CP（auto_cp=True，无 inter）
   - inter:      纯 inter-card CP（build_cp_context）
-  - inter_intra:卡间 inter + 卡内 intra（build_inter_intra_cp_context）
+  - inter_intra:卡间 inter + 卡内 intra（build_cp_context enable_inter+enable_intra）
 
 每个模式内部用 ``with timer.mark('tag')`` 标注各步，外层 ``timer.bench()``
 控制 warmup+rep 迭代并对各 tag 求均值，最后按 tag 对齐打印对比表。重点观察
@@ -39,7 +39,7 @@ from flash_qla.ops.gated_delta_rule.chunk import (
     get_warmup_chunks, get_warmup_chunks_bidi, CHUNK_SIZE,
 )
 from flash_qla.ops.gated_delta_rule.chunk.cp import (
-    build_cp_context, build_intra_cp_context, build_inter_intra_cp_context,
+    build_cp_context,
 )
 from flash_qla.ops.gated_delta_rule.chunk.cp.comm import (
     all_gather_into_tensor, pack_hm, unpack_hm,
@@ -49,6 +49,29 @@ from flash_qla.ops.gated_delta_rule.chunk.cp.comm import (
 from profile_inter_cp import generate_inputs, slice_inputs
 
 CHUNK = 64
+
+
+def _ii_warmup_fallback(ctx, g_c, chunk_size=CHUNK):
+    """inter+intra warmup/fallback (mirrors cp/preprocess.py): g-dependent bidi
+    warmup with the first/last cp sub-chunks of each raw seq forced to full
+    (they carry the inter boundary and must always be warmed up + corrected).
+    Returns fwd/bwd warmup counts and fallback masks."""
+    cp_cu = ctx.intra_cp_cu_seqlens
+    seq_map_r2c = ctx.seq_map_r2c
+    nwh, nwb, fbf, fbb = get_warmup_chunks_bidi(
+        g=g_c, cu_seqlens=cp_cu, ht_mask_fwd=ctx.ht_mask,
+        ht_mask_bwd=ctx.ht_mask_bwd, chunk_size=chunk_size,
+    )
+    first_end = seq_map_r2c[1]
+    last_start = seq_map_r2c[-2]
+    first_full = ((cp_cu[1:first_end + 1] - cp_cu[:first_end] + chunk_size - 1) // chunk_size).unsqueeze(-1)
+    last_full = ((cp_cu[last_start + 1:] - cp_cu[last_start:-1] + chunk_size - 1) // chunk_size).unsqueeze(-1)
+    for nw, fb in ((nwh, fbf), (nwb, fbb)):
+        fb[:first_end] = True
+        fb[last_start:] = True
+        nw[:first_end] = first_full
+        nw[last_start:] = last_full
+    return nwh, nwb, fbf, fbb
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +107,8 @@ def _e2e(timer, tag, d, scale, cp_context, auto_cp, cu_seqlens=None):
 # ---------------------------------------------------------------------------
 def intra_stages(timer, full, scale, cu):
     """切分前单卡：整条序列在单卡上跑 intra CP（或 intra 未触发时的裸单卡）。"""
-    ictx = build_intra_cp_context(None, full["k"], full["v"], CHUNK_SIZE, cu, auto_cp=True)
-    use_intra = ictx.use_intra_cp
+    ictx = build_cp_context(cu, enable_intra=True, num_v_heads=full["v"].shape[2], chunk_size=CHUNK_SIZE)
+    use_intra = ictx.is_intra
     cp_cu = ictx.intra_cp_cu_seqlens if use_intra else cu
 
     def fwd(t):
@@ -162,7 +185,7 @@ def inter_stages(timer, local, ctx, scale, prefix="inter"):
 # ---------------------------------------------------------------------------
 def inter_intra_stages(timer, local, ctx, scale):
     """切分后 inter+intra 合并，逐阶段。intra 未触发时退化为 inter 拆解。"""
-    if not ctx.use_intra_cp:
+    if not ctx.is_intra:
         inter_stages(timer, local, ctx, scale, prefix="inter_intra")
         return
     cu = ctx.cu_seqlens
@@ -174,13 +197,14 @@ def inter_intra_stages(timer, local, ctx, scale):
     rank = dist.get_rank(group=ctx.group)
     pre = ctx.pre_num_ranks
     dev = local["k"].device
-    nwh, fbf = ctx.intra_num_warmup, ctx.intra_fallback  # precomputed on context
 
     def fwd(t):
         with t.mark("inter_intra::cumsum"):
             g_c = chunk_local_cumsum(local["g"], cu_seqlens=cu, chunk_size=CHUNK)
         with t.mark("inter_intra::kkt_solve"):
             A = kkt_solve(local["k"], local["beta"], cu_seqlens=cu, chunk_size=CHUNK)
+        with t.mark("inter_intra::warmup"):
+            nwh, _, fbf, _ = _ii_warmup_fallback(ctx, g_c)
         with t.mark("inter_intra::prepare_h"):
             _, ht, mt = fused_gdr_h(k=local["k"], v=local["v"], a=A, g=g_c, b=local["beta"],
                                     initial_state=None, output_final_state=True, output_h=False,
@@ -218,8 +242,8 @@ def inter_intra_stages(timer, local, ctx, scale):
 def intra_stages_bwd(timer, full, scale, cu):
     if fused_gdr_bwd is None:
         return
-    ictx = build_intra_cp_context(None, full["k"], full["v"], CHUNK_SIZE, cu, auto_cp=True, is_bwd=True)
-    use_intra = ictx.use_intra_cp
+    ictx = build_cp_context(cu, enable_intra=True, num_v_heads=full["v"].shape[2], chunk_size=CHUNK_SIZE, is_bwd=True)
+    use_intra = ictx.is_intra
     cp_cu = ictx.intra_cp_cu_seqlens if use_intra else cu
     Hg, Hv = full["k"].shape[2], full["v"].shape[2]
     g_c = chunk_local_cumsum(full["g"], cu_seqlens=cu, chunk_size=CHUNK)
@@ -336,7 +360,7 @@ def inter_stages_bwd(timer, local, ctx, scale, prefix="inter"):
 def inter_intra_stages_bwd(timer, local, ctx, scale):
     if fused_gdr_bwd is None:
         return
-    if not ctx.use_intra_cp:
+    if not ctx.is_intra:
         inter_stages_bwd(timer, local, ctx, scale, prefix="inter_intra")
         return
     cu = ctx.cu_seqlens
@@ -348,8 +372,9 @@ def inter_intra_stages_bwd(timer, local, ctx, scale):
     rank = dist.get_rank(group=ctx.group)
     pre, post = ctx.pre_num_ranks, ctx.post_num_ranks
     dev = local["k"].device
-    nwh, fbf = ctx.intra_num_warmup, ctx.intra_fallback  # precomputed on context
     g_c = chunk_local_cumsum(local["g"], cu_seqlens=cu, chunk_size=CHUNK)
+    # fwd warmup/fallback set up the (untimed) fwd artifacts; bwd ones drive the timed bwd.
+    nwh, nwb, fbf, fbb = _ii_warmup_fallback(ctx, g_c)
     A = kkt_solve(local["k"], local["beta"], cu_seqlens=cu, chunk_size=CHUNK)
     _, ht, mt = fused_gdr_h(k=local["k"], v=local["v"], a=A, g=g_c, b=local["beta"],
         initial_state=None, output_final_state=True, output_h=False,
@@ -375,9 +400,9 @@ def inter_intra_stages_bwd(timer, local, ctx, scale):
         with t.mark("inter_intra::b_prepare_dh"):
             _, dh_buf = fused_gdr_dh(q=local["q"], k=local["k"], a=A, g=g_c, b=local["beta"], do=do,
                 dht=None, output_dh0=True, output_dh=False, scale=scale,
-                cu_seqlens=cp_cu, num_warmup_chunks=nwh, state_v_first=False)
+                cu_seqlens=cp_cu, num_warmup_chunks=nwb, state_v_first=False)
         with t.mark("inter_intra::b_aggregate"):
-            dS_card, _ = aggregate_card_state(dh_buf, mtf, fbf, seq_map_r2c, state_v_first=False,
+            dS_card, _ = aggregate_card_state(dh_buf, mtf, fbb, seq_map_r2c, state_v_first=False,
                 reverse=True, transpose_m=True, compute_m=False)
         with t.mark("inter_intra::b_all_gather"):
             hmb = pack_hm(dS_card[0], M_card[0]); agb, _ = all_gather_into_tensor(hmb, group=ctx.group)
@@ -391,7 +416,7 @@ def inter_intra_stages_bwd(timer, local, ctx, scale):
                 card_dht[N - 1] = cdt[0]
         with t.mark("inter_intra::b_intra_correct"):
             cp_dht = correct_terminal_states(raw_dht=card_dht, dht_buffer=dh_buf, mt_buffer=mtf,
-                fallback_mask=fbf, seq_map_r2c=seq_map_r2c, state_v_first=False)
+                fallback_mask=fbb, seq_map_r2c=seq_map_r2c, state_v_first=False)
         with t.mark("inter_intra::b_recompute_h"):
             h, _, _ = fused_gdr_h(k=local["k"], v=local["v"], a=A, g=g_c, b=local["beta"],
                 initial_state=cp_h0, output_final_state=False, output_h=True,
@@ -437,13 +462,13 @@ def main():
     local = slice_inputs(inputs, lo, hi)
     scale = inputs["scale"]
 
-    ctx_inter = build_cp_context(inputs["cu_g"], group=dist.group.WORLD)
-    ctx_ii = build_inter_intra_cp_context(inputs["cu_g"], group=dist.group.WORLD,
-                                          v=local["v"], chunk_size=CHUNK_SIZE)
+    ctx_inter = build_cp_context(inputs["cu_g"], group=dist.group.WORLD, enable_inter=True)
+    ctx_ii = build_cp_context(inputs["cu_g"], group=dist.group.WORLD, num_v_heads=local["v"].shape[2],
+                              chunk_size=CHUNK_SIZE, enable_inter=True, enable_intra=True)
 
     if rank == 0:
         print(f"T={T} W={W} per-rank={part} Hk={args.nkh} Hv={args.nvh} "
-              f"ii.use_intra_cp={ctx_ii.use_intra_cp} cu={cu or [0, T]}")
+              f"ii.is_intra={ctx_ii.is_intra} cu={cu or [0, T]}")
 
     # intra baseline = 切分前单卡：整条全局序列在单卡上（full tensors, 不切分）
     full = {kk: inputs[kk] for kk in ("q", "k", "v", "g", "beta")}
@@ -495,7 +520,7 @@ def main():
         # 各模式 stage 求和作为 TOTAL（忽略 NaN）
         rows["TOTAL"] = {m: sum(v for v in (g(f"{m}::{st}") for st in stages) if v == v)
                          for m in modes}
-        ii_mode = "intra ON" if ctx_ii.use_intra_cp else "intra OFF→inter"
+        ii_mode = "intra ON" if ctx_ii.is_intra else "intra OFF→inter"
         print(f"\n{'='*72}\nForward 逐阶段 (ms)  [inter_intra: {ii_mode}]:")
         if pd is not None:
             df = pd.DataFrame(rows).T.reindex(columns=modes)

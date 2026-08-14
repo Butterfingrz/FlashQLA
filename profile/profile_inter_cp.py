@@ -700,7 +700,7 @@ def profile_one(
         random_seed=random_seed, cu_seqlens=cu_seqlens,
     )
     local = slice_inputs(inputs, lo, hi)
-    ctx = build_cp_context(inputs["cu_g"], group=dist.group.WORLD)
+    ctx = build_cp_context(inputs["cu_g"], group=dist.group.WORLD, enable_inter=True)
 
     if rank == 0:
         print(f"Shape: T={T} (per-rank {part}) W={W} Hk={num_k_heads} "
@@ -852,7 +852,7 @@ def main():
             random_seed=args.seed, cu_seqlens=cu,
         )
         local = slice_inputs(inputs, lo, hi)
-        ctx = build_cp_context(inputs["cu_g"], group=dist.group.WORLD)
+        ctx = build_cp_context(inputs["cu_g"], group=dist.group.WORLD, enable_inter=True)
         if rank == 0:
             print(f"[nsys] T={T} W={W} per-rank={part} Hk={args.nkh} Hv={args.nvh} "
                   f"warmup={args.warmup} rep={args.rep} cuda_graph={args.cuda_graph}")

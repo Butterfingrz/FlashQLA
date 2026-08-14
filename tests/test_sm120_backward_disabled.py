@@ -5,7 +5,7 @@
 
 On SM120, only forward pass is supported. Any attempt to invoke the backward
 path — whether through the low-level ``chunk_gated_delta_rule_bwd`` API, the
-autograd ``.backward()`` path, or the CP ``intra_cp_preprocess_bwd``
+autograd ``.backward()`` path, or the CP ``cp_preprocess_bwd``
 helper — must raise ``NotImplementedError`` with a clear message.
 """
 
@@ -13,9 +13,13 @@ import pytest
 import torch
 import tilelang
 
-from flash_qla import chunk_gated_delta_rule_fwd as chunk_gated_delta_rule_fwd_qla
-from flash_qla import chunk_gated_delta_rule_bwd as chunk_gated_delta_rule_bwd_qla
 from flash_qla import chunk_gated_delta_rule
+from flash_qla.ops.gated_delta_rule.chunk import (
+    chunk_gated_delta_rule_fwd as _chunk_gdr_fwd_impl,
+    chunk_gated_delta_rule_bwd as _chunk_gdr_bwd_impl,
+    _auto_intra_cp_context,
+    CHUNK_SIZE,
+)
 from flash_qla.utils import l2norm
 
 # ---------------------------------------------------------------------------
@@ -23,6 +27,36 @@ from flash_qla.utils import l2norm
 # ---------------------------------------------------------------------------
 HEAD_DIM_K = 128
 HEAD_DIM_V = 128
+
+
+# The low-level chunk functions require a non-null cp_context (the null->auto
+# guard now lives in the autograd Function). These wrappers build the auto
+# intra-CP context the same way the autograd Function does.
+
+def chunk_gated_delta_rule_fwd_qla(
+    q, k, v, g, beta, scale=None, initial_state=None, cu_seqlens=None,
+    output_final_state=True, output_h=False, auto_cp=True, state_v_first=False,
+    enable_fwd_cp_cache=False, cp_context=None,
+):
+    if cp_context is None:
+        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=False)
+    return _chunk_gdr_fwd_impl(
+        q, k, v, g, beta, scale, initial_state, cu_seqlens,
+        output_final_state, output_h, auto_cp, state_v_first,
+        enable_fwd_cp_cache, cp_context,
+    )
+
+
+def chunk_gated_delta_rule_bwd_qla(
+    q, k, v, g, beta, A, do, dht=None, scale=None, initial_state=None,
+    cu_seqlens=None, state_v_first=False, auto_cp=True, cp_cache=None, cp_context=None,
+):
+    if cp_context is None:
+        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=True)
+    return _chunk_gdr_bwd_impl(
+        q, k, v, g, beta, A, do, dht, scale, initial_state,
+        cu_seqlens, state_v_first, auto_cp, cp_cache, cp_context,
+    )
 
 
 def _make_inputs(batch_size=1, num_tokens=256, num_k_heads=4, num_v_heads=4,
@@ -172,9 +206,9 @@ def test_autograd_backward_raises_not_implemented():
 @pytest.mark.gpu
 @pytest.mark.sm120
 def test_cp_preprocess_bwd_raises_not_implemented():
-    """``intra_cp_preprocess_bwd`` must raise NotImplementedError on SM120."""
+    """``cp_preprocess_bwd`` (intra) must raise NotImplementedError on SM120."""
     from flash_qla.ops.gated_delta_rule.chunk.cp import (
-        intra_cp_preprocess_bwd, build_intra_cp_context,
+        cp_preprocess_bwd, build_cp_context,
     )
 
     q, k, v, g, beta, do, h0, dht, scale = _make_inputs(
@@ -202,19 +236,18 @@ def test_cp_preprocess_bwd_raises_not_implemented():
 
     # Build the intra-card context explicitly, then invoke backward preprocess —
     # it must raise NotImplementedError on SM120 (no fused_gdr_dh) regardless of use_cp.
-    cp_ctx = build_intra_cp_context(
-        None, k, v, A_qla.shape[-1], cu_seqlens=None, auto_cp=True, is_bwd=True,
+    cu = torch.tensor([0, v.shape[1]], dtype=torch.int32, device=v.device)
+    cp_ctx = build_cp_context(
+        cu, enable_intra=True, num_v_heads=v.shape[2], chunk_size=A_qla.shape[-1], is_bwd=True,
     )
     with pytest.raises(NotImplementedError) as exc_info:
-        intra_cp_preprocess_bwd(
+        cp_preprocess_bwd(
             cp_ctx,
-            k=k, v=v, a=A_qla, g=g, b=beta,
-            raw_h0=h0_ref,
-            q=q, do=do, dht=dht_ref,
-            scale=scale,
-            state_v_first=False,
+            q=q, k=k, v=v, a=A_qla, g=g, beta=beta,
+            do=do, dht=dht_ref, scale=scale,
+            initial_state=h0_ref, state_v_first=False, cp_cache=None,
         )
-    _assert_not_implemented_error(exc_info, "intra_cp_preprocess_bwd")
+    _assert_not_implemented_error(exc_info, "cp_preprocess_bwd")
 
 
 # ---------------------------------------------------------------------------

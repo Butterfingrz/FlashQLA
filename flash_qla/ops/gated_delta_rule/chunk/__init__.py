@@ -26,10 +26,25 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
 else:
     raise ValueError(f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
 from .cp import (
-    build_intra_cp_context, cp_preprocess_fwd, cp_preprocess_bwd, finalize_dh0, FlashQLACPContext,
+    build_cp_context, cp_preprocess_fwd, cp_preprocess_bwd, FlashQLACPContext,
+    _create_cu_seqlens,
 )
 
 from flash_qla.utils import input_guard
+
+
+def _auto_intra_cp_context(k, v, cu_seqlens, chunk_size, auto_cp, is_bwd):
+    """Interpret the raw input and build an intra-CP context via build_cp_context.
+    Intra needs the flattened varlen (batch-1) layout: a dense [B>1, T] input can't
+    use it, and a dense [1, T] input gets a cu_seqlens synthesized."""
+    enable_intra = auto_cp and k.shape[0] == 1
+    cu = cu_seqlens
+    if enable_intra and cu is None:
+        cu = _create_cu_seqlens(k.shape[0], k.shape[1], k.device.index)
+    return build_cp_context(
+        cu, enable_intra=enable_intra, num_v_heads=v.shape[2],
+        chunk_size=chunk_size, is_bwd=is_bwd,
+    )
 
 
 def chunk_gated_delta_rule_fwd(
@@ -48,11 +63,6 @@ def chunk_gated_delta_rule_fwd(
     enable_fwd_cp_cache: bool = False,
     cp_context: FlashQLACPContext | None = None,
 ):
-    # Since intra + inter is not supported, intra CP is only enabled when inter CP is not enabled. 
-    if cp_context is None:
-        cp_context = build_intra_cp_context(
-            cp_context, k, v, CHUNK_SIZE, cu_seqlens, auto_cp=auto_cp, is_bwd=False)
-
     g = chunk_local_cumsum(
         g=g,
         cu_seqlens=cp_context.cu_seqlens,
@@ -73,9 +83,7 @@ def chunk_gated_delta_rule_fwd(
     # Both standalone intra and combined inter+intra run the main kernel over the
     # local intra-chunk partition; inter (and degenerate inter+intra) use the raw
     # local cu_seqlens.
-    use_intra_layout = cp_context.is_intra_cp_enabled or (
-        cp_context.is_inter_intra_cp_enabled and cp_context.use_intra_cp
-    )
+    use_intra_layout = cp_context.is_intra
     o, h, final_state = fused_gdr_fwd(
         q=q,
         k=k,
@@ -121,10 +129,6 @@ def chunk_gated_delta_rule_bwd(
 
     chunk_size = A.shape[-1]
 
-    if cp_context is None:
-        cp_context = build_intra_cp_context(
-            cp_context, k, v, chunk_size, cu_seqlens, auto_cp=auto_cp, is_bwd=True)
-
     h0, dht = cp_preprocess_bwd(
         cp_context, q=q, k=k, v=v, a=A, g=g, beta=beta, do=do, dht=dht, scale=scale,
         initial_state=initial_state,
@@ -132,9 +136,7 @@ def chunk_gated_delta_rule_bwd(
         cp_cache=cp_cache,
     )
 
-    use_intra_layout = cp_context.is_intra_cp_enabled or (
-        cp_context.is_inter_intra_cp_enabled and cp_context.use_intra_cp
-    )
+    use_intra_layout = cp_context.is_intra
     h, _, _ = fused_gdr_h(
         k=k, v=v, a=A, g=g, b=beta,
         initial_state=h0,
@@ -150,7 +152,15 @@ def chunk_gated_delta_rule_bwd(
         state_v_first=state_v_first,
     )
 
-    dh0 = finalize_dh0(dh0, cp_context, initial_state is not None)
+    # CP dh0 post-process: intra remaps per-chunk dh0 back to per-raw-seq; inter zeroes
+    # the first local seq's grad (it belongs to the previous card).
+    if dh0 is None or initial_state is None:
+        dh0 = None
+    else:
+        if cp_context.is_intra:
+            dh0 = dh0[cp_context.seq_map_r2c[:-1].long()]
+        if cp_context.is_inter and not cp_context.is_first_rank:
+            dh0[0] = 0
 
     Hg, H = k.shape[-2], v.shape[-2]
     if Hg < H:
@@ -186,6 +196,11 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         if use_qk_l2norm_in_kernel:
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
+
+        # No explicit context -> auto intra CP.
+        if cp_context is None:
+            cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=False)
+
 
         g, A, o, _, final_state, cp_cache = chunk_gated_delta_rule_fwd(
             q=q,
@@ -364,9 +379,7 @@ def chunk_gated_delta_rule(
         "num_qk_heads must be divisible to num_v_heads."
     )
 
-    is_inter = cp_context is not None and (
-        cp_context.is_inter_cp_enabled or cp_context.is_inter_intra_cp_enabled
-    )
+    is_inter = cp_context is not None and cp_context.is_inter
     if is_inter and q.shape[0] != 1:
         raise ValueError("inter-card CP requires B==1 (varlen).")
 
