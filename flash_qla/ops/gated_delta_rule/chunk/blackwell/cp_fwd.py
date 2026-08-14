@@ -350,6 +350,7 @@ def tilelang_correct_h0(
             T.copy(mt_buffer[idx, bh, 0:DK, 0:DK], m_shared)
             if fallback_mask[idx, bh]:
                 T.copy(h_fragment, hd_shared)     # save h_prev
+                T.fence_proxy_async()
             T.copy(h_shared, h_fragment)          # h_fragment = h_idx
             if fallback_mask[idx, bh]:
                 # h_fragment += M (op) h_prev, matching layout / transpose_m

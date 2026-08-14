@@ -24,7 +24,7 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
     fused_gdr_dh = None
     CHUNK_SIZE = 32
 else:
-    raise ValueError(f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
+    raise ValueError(f"FlashQLA now support sm90, sm100, sm103 and sm120 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
 from .cp import (
     build_cp_context, cp_preprocess_fwd, cp_preprocess_bwd, FlashQLACPContext,
     _create_cu_seqlens,
