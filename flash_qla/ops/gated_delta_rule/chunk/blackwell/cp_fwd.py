@@ -351,6 +351,13 @@ def tilelang_correct_h0(
             if fallback_mask[idx, bh]:
                 T.copy(h_fragment, hd_shared)     # save h_prev
                 T.fence_proxy_async()
+            # `h_shared` / `m_shared` were just filled cooperatively, so the barrier
+            # before reading them back has to be unconditional. Left implicit, the sync
+            # pass sinks it into the `fallback_mask` block above (the first shared *read*
+            # it sees), and a non-fallback segment then reads the tile while other threads
+            # are still writing it -- O(1) wrong, non-deterministically. See
+            # test_cp_kernels.test_aggregate_card_state_survives_a_non_fallback_iteration.
+            T.sync_threads()
             T.copy(h_shared, h_fragment)          # h_fragment = h_idx
             if fallback_mask[idx, bh]:
                 # h_fragment += M (op) h_prev, matching layout / transpose_m
