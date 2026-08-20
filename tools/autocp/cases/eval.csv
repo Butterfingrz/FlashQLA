@@ -1,0 +1,11 @@
+# autocp held-out shapes: scored, never fitted. Same schema as cases_train.csv.
+# Chosen to move one axis each away from the training set: an unseen H, a longer
+# sequence, a wider batch, a raggeder varlen mix, and -- deliberately -- one
+# shape short enough (64 chunks) that CP was expected to lose, since a verdict
+# check needs a candidate for each side. It measured faster with CP on anyway.
+name,H,seqlens
+h16,16,32768
+h48_long,48,65536
+h8_b8,8,"4096,4096,4096,4096,4096,4096,4096,4096"
+va_ragged,24,"1024,7000,20000"
+short,16,4096

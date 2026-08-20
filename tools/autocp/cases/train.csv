@@ -1,0 +1,13 @@
+# autocp calibration shapes (training set).
+# One row per shape; the L_cp grid is enumerated by utils.lcp_grid, and the
+# kernel times are measured by measure.py -- neither belongs in this file.
+# Columns: name (report/regret grouping key, must be unique), H (value heads),
+# seqlens (per-sequence tokens). Hk/dtype/swa_ratio fall back to the CLI.
+name,H,seqlens
+h8,8,32768
+h32,32,32768
+h64,64,32768
+b2,16,"16384,16384"
+b4,16,"8192,8192,8192,8192"
+va,16,"4096,8192,16384"
+vb,16,"2048,4096,8192,16384"

@@ -856,6 +856,7 @@ def fused_gdr_fwd(
         block_DV = 128
     else:
         block_DV = 64
+    block_DV = 128  # DEBUG: 关掉自适应分支, 使 fwd grid = N_p·H 与其余 kernel 对齐, ceiling 可合并
 
     tilelang_fused_chunk_gdr_fwd_kernel = tilelang_fused_chunk_gdr_fwd(
         H,
