@@ -4,7 +4,7 @@
 
 Holds the direct-call wrappers, input construction and relative-error assertion
 used by both the pure-kernel correctness suite (``test_gdr_unit.py``) and the
-single-GPU intra-card CP tests (``test_cp.py``).
+single-GPU intra-card CP feature tests (``test_cp_features.py``).
 """
 import os
 import sys
@@ -47,10 +47,13 @@ DEVICE = "cuda"
 def chunk_gated_delta_rule_fwd_qla(
     q, k, v, g, beta, scale=None, initial_state=None, cu_seqlens=None,
     output_final_state=True, output_h=False, auto_cp=True, state_v_first=False,
-    enable_fwd_cp_cache=False, cp_context=None,
+    enable_fwd_cp_cache=False, cp_context=None, force_intra_cp=False,
 ):
     if cp_context is None:
-        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=False)
+        cp_context = _auto_intra_cp_context(
+            k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=False,
+            force_intra_cp=force_intra_cp,
+        )
     return _chunk_gdr_fwd_impl(
         q, k, v, g, beta, scale, initial_state, cu_seqlens,
         output_final_state, output_h, auto_cp, state_v_first,
@@ -61,9 +64,13 @@ def chunk_gated_delta_rule_fwd_qla(
 def chunk_gated_delta_rule_bwd_qla(
     q, k, v, g, beta, A, do, dht=None, scale=None, initial_state=None,
     cu_seqlens=None, state_v_first=False, auto_cp=True, cp_cache=None, cp_context=None,
+    force_intra_cp=False,
 ):
     if cp_context is None:
-        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=True)
+        cp_context = _auto_intra_cp_context(
+            k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=True,
+            force_intra_cp=force_intra_cp,
+        )
     return _chunk_gdr_bwd_impl(
         q, k, v, g, beta, A, do, dht, scale, initial_state,
         cu_seqlens, state_v_first, auto_cp, cp_cache, cp_context,

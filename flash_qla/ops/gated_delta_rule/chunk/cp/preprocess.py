@@ -18,6 +18,17 @@ class CPCache:
     num_warmup_bwd: torch.Tensor | None = None    # pure-intra bwd warmup counts
 
 
+def _assert_inter_intra_supported(is_inter, is_intra, aggregate_card_state):
+    """Combined inter+intra CP needs ``aggregate_card_state``, which only the
+    SM100/SM103 kernels provide so far. Fail loudly instead of on a ``None`` call."""
+    if is_inter and is_intra and aggregate_card_state is None:
+        raise NotImplementedError(
+            "Combined inter+intra CP requires `aggregate_card_state`, which is not "
+            "implemented for this architecture (SM100/SM103 only). Use pure inter-card "
+            "CP (build_cp_context(..., enable_inter=True)) or pure intra-card CP instead."
+        )
+
+
 # ---------------------------------------------------------------------------
 # shared inter correction: gather this card's boundary (h, M) with its neighbours and
 # correct it into a per-seq card state (fwd) / terminal grad (bwd).
@@ -100,6 +111,7 @@ def cp_preprocess_fwd(
     is_inter, is_intra = cp_context.is_inter, cp_context.is_intra
     if not is_inter and not is_intra:
         return initial_state, None
+    _assert_inter_intra_supported(is_inter, is_intra, aggregate_card_state)
 
     Hv, V = v.shape[2], v.shape[3]
     chunk_size = a.shape[-1]
@@ -210,6 +222,7 @@ def cp_preprocess_bwd(
     is_inter, is_intra = cp_context.is_inter, cp_context.is_intra
     if not is_inter and not is_intra:
         return initial_state, dht
+    _assert_inter_intra_supported(is_inter, is_intra, aggregate_card_state)
 
     if fused_gdr_dh is None:
         raise NotImplementedError(

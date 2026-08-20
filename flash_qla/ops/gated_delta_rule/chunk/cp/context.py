@@ -115,6 +115,7 @@ def build_cp_context(
     conv1d_kernel_size: int | None = None,
     cu_seqlens_cpu: torch.Tensor | None = None,
     is_bwd: bool = False,
+    force_intra_cp: bool = False,
 ) -> FlashQLACPContext:
     """Unified CP-context builder over the canonical ``(cu_seqlens, num_v_heads)``.
     ``enable_inter``/``enable_intra`` select the mode: (T,F) pure inter | (F,T) pure
@@ -122,6 +123,8 @@ def build_cp_context(
 
     - inter needs ``group``.
     - intra needs ``cu_seqlens`` (varlen), ``chunk_size`` and ``num_v_heads``.
+    - ``force_intra_cp`` bypasses the intra heuristic and always splits, for tests and
+      profiling that need the intra path on configurations the heuristic would skip.
 
     Pure metadata — it takes no raw ``q/k/v`` tensors and does no batch/dense
     interpretation. The caller (the chunk driver) turns a raw input into a varlen
@@ -137,7 +140,7 @@ def build_cp_context(
         )
         intra_ctx = _calc_intra_cp_seqs(
             raw_cu_seqlens=inter_ctx.cu_seqlens, chunk_size=chunk_size,
-            num_v_heads=num_v_heads, is_bwd=is_bwd,
+            num_v_heads=num_v_heads, is_bwd=is_bwd, force_intra_cp=force_intra_cp,
         )
         return FlashQLACPContext(
             is_inter=True,
@@ -169,7 +172,7 @@ def build_cp_context(
         assert cu_seqlens is not None and chunk_size is not None and num_v_heads is not None
         return _calc_intra_cp_seqs(
             raw_cu_seqlens=cu_seqlens, chunk_size=chunk_size,
-            num_v_heads=num_v_heads, is_bwd=is_bwd,
+            num_v_heads=num_v_heads, is_bwd=is_bwd, force_intra_cp=force_intra_cp,
         )
 
     return FlashQLACPContext(cu_seqlens=cu_seqlens)
@@ -249,6 +252,7 @@ def _calc_intra_cp_seqs(
     chunk_size: int,
     num_v_heads: int,
     is_bwd: bool = False,
+    force_intra_cp: bool = False,
 ) -> FlashQLACPContext:
     device = raw_cu_seqlens.device
     seqlen_dtype = raw_cu_seqlens.dtype
@@ -326,8 +330,8 @@ def _calc_intra_cp_seqs(
             f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {_COMPUTE_VERSION}"
         )
 
-    # DEBUG
-    use_cp=True
+    # Explicit override for tests / profiling: split regardless of the heuristic.
+    use_cp = use_cp or force_intra_cp
 
     if use_cp:
         cp_cu_seqlens = torch.tensor(

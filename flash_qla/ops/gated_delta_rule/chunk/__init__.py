@@ -7,10 +7,15 @@ import tilelang
 from flash_qla.utils import l2norm_fwd, l2norm_bwd, prepare_chunk_offsets
 from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
 
+# `aggregate_card_state` is only needed by combined inter+intra CP. It relies on the
+# `store_inter_h` / `compute_m` modes of `tilelang_correct_h0`, which so far exist only
+# in the SM100/SM103 kernels; where it is `None`, pure inter and pure intra still work
+# and `cp_preprocess_fwd/bwd` reject inter+intra with an explicit error.
 if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
     from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
-    from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
+    from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
     from .hopper.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
+    aggregate_card_state = None
     CHUNK_SIZE = 64
 elif tilelang.contrib.nvcc.get_target_compute_version() in ["10.0", "10.3"]:
     from .blackwell import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
@@ -19,9 +24,10 @@ elif tilelang.contrib.nvcc.get_target_compute_version() in ["10.0", "10.3"]:
     CHUNK_SIZE = 64
 elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
     from .blackwell_sm120 import fused_gdr_fwd, fused_gdr_h, kkt_solve
-    from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
+    from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
     fused_gdr_bwd = None
     fused_gdr_dh = None
+    aggregate_card_state = None
     CHUNK_SIZE = 32
 else:
     raise ValueError(f"FlashQLA now support sm90, sm100, sm103 and sm120 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
@@ -33,7 +39,8 @@ from .cp import (
 from flash_qla.utils import input_guard
 
 
-def _auto_intra_cp_context(k, v, cu_seqlens, chunk_size, auto_cp, is_bwd):
+def _auto_intra_cp_context(k, v, cu_seqlens, chunk_size, auto_cp, is_bwd,
+                           force_intra_cp=False):
     """Interpret the raw input and build an intra-CP context via build_cp_context.
     Intra needs the flattened varlen (batch-1) layout: a dense [B>1, T] input can't
     use it, and a dense [1, T] input gets a cu_seqlens synthesized."""
@@ -43,7 +50,7 @@ def _auto_intra_cp_context(k, v, cu_seqlens, chunk_size, auto_cp, is_bwd):
         cu = _create_cu_seqlens(k.shape[0], k.shape[1], k.device.index)
     return build_cp_context(
         cu, enable_intra=enable_intra, num_v_heads=v.shape[2],
-        chunk_size=chunk_size, is_bwd=is_bwd,
+        chunk_size=chunk_size, is_bwd=is_bwd, force_intra_cp=force_intra_cp,
     )
 
 
@@ -191,6 +198,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         enable_fwd_cp_cache: bool = True,
         cp_context=None,
+        force_intra_cp: bool = False,
     ):
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
@@ -199,7 +207,10 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
         # No explicit context -> auto intra CP.
         if cp_context is None:
-            cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=False)
+            cp_context = _auto_intra_cp_context(
+                k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=False,
+                force_intra_cp=force_intra_cp,
+            )
 
 
         g, A, o, _, final_state, cp_cache = chunk_gated_delta_rule_fwd(
@@ -271,6 +282,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             None,          # use_qk_l2norm_in_kernel
             None,          # enable_fwd_cp_cache
             None,          # cp_context
+            None,          # force_intra_cp
         )
 
 
@@ -291,6 +303,7 @@ def chunk_gated_delta_rule(
     auto_cp: bool = True,
     enable_fwd_cp_cache: bool = True,
     cp_context=None,
+    force_intra_cp: bool = False,
 ):
     r"""
     Args:
@@ -329,6 +342,10 @@ def chunk_gated_delta_rule(
             Whether to enable automatic intra-card CP. Default: `True`.
         enable_fwd_cp_cache (Optional[bool]):
             Whether to cache CP related variables during the forward pass. Default: `True`.
+        force_intra_cp (Optional[bool]):
+            Whether to bypass the intra-card CP heuristic and always split. Ignored when
+            `auto_cp=False` (which disables intra CP outright) or when an explicit
+            `cp_context` is passed. Intended for tests and profiling. Default: `False`.
 
     Returns:
         o (torch.Tensor):
@@ -413,6 +430,7 @@ def chunk_gated_delta_rule(
         use_qk_l2norm_in_kernel,
         enable_fwd_cp_cache,
         cp_context,
+        force_intra_cp,
     )
 
     return o, final_state
