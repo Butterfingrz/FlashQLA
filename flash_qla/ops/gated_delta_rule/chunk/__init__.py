@@ -47,11 +47,16 @@ def chunk_gated_delta_rule_fwd(
     state_v_first: bool = False,
     enable_fwd_cp_cache: bool = False,
     cp_context: FlashQLACPContext | None = None,
+    is_train: bool | None = None,
 ):
+    if is_train is None:
+        is_train = bool(enable_fwd_cp_cache)
+
     # Since intra + inter is not supported, intra CP is only enabled when inter CP is not enabled. 
     if cp_context is None:
         cp_context = build_intra_cp_context(
-            cp_context, k, v, CHUNK_SIZE, cu_seqlens, auto_cp=auto_cp, is_bwd=False)
+            cp_context, k, v, CHUNK_SIZE, cu_seqlens, auto_cp=auto_cp,
+            is_train=is_train)
 
     g = chunk_local_cumsum(
         g=g,
@@ -117,7 +122,8 @@ def chunk_gated_delta_rule_bwd(
 
     if cp_context is None:
         cp_context = build_intra_cp_context(
-            cp_context, k, v, chunk_size, cu_seqlens, auto_cp=auto_cp, is_bwd=True)
+            cp_context, k, v, chunk_size, cu_seqlens, auto_cp=auto_cp,
+            is_train=True)
 
     h0, dht = cp_preprocess_bwd(
         cp_context, q=q, k=k, v=v, a=A, g=g, beta=beta, do=do, dht=dht, scale=scale,
@@ -172,6 +178,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         enable_fwd_cp_cache: bool = True,
         cp_context=None,
+        is_train: bool = False,
     ):
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
@@ -193,6 +200,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             auto_cp=auto_cp,
             enable_fwd_cp_cache=enable_fwd_cp_cache,
             cp_context=cp_context,
+            is_train=is_train,
         )
 
         ctx.save_for_backward(q, k, q_rstd, k_rstd, v, g, beta, A, initial_state, cu_seqlens)
@@ -247,6 +255,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             None,          # use_qk_l2norm_in_kernel
             None,          # enable_fwd_cp_cache
             None,          # cp_context
+            None,          # is_train
         )
 
 
@@ -305,6 +314,8 @@ def chunk_gated_delta_rule(
             Whether to enable automatic intra-card CP. Default: `True`.
         enable_fwd_cp_cache (Optional[bool]):
             Whether to cache CP related variables during the forward pass. Default: `True`.
+            Ignored unless a backward will follow (no input requires grad, or grad is
+            disabled), since nothing would ever read the cache.
 
     Returns:
         o (torch.Tensor):
@@ -374,6 +385,12 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
+    is_train = torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad
+        for t in (q, k, v, g, beta, initial_state)
+    )
+    enable_fwd_cp_cache = bool(enable_fwd_cp_cache) and is_train
+
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
@@ -389,6 +406,7 @@ def chunk_gated_delta_rule(
         use_qk_l2norm_in_kernel,
         enable_fwd_cp_cache,
         cp_context,
+        is_train,
     )
 
     return o, final_state

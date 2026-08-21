@@ -1,22 +1,5 @@
 # Copyright (c) 2026 The Qwen team, Alibaba Group.
 # Licensed under The MIT License [see LICENSE for details]
-"""Isolated timing of the four intra-CP kernels, one row per ``(shape, L_cp)``.
-
-This is the measurement half of :mod:`.fit`: it turns a ``ShapeSpec`` plus an
-``L_cp`` grid into cache rows, and knows nothing about least squares. Needs torch
-/ tilelang -- which is half the reason it lives out here in ``tools/`` rather than
-in the shipped package: nothing on the launch path may import it.
-
-Two things it deliberately does *not* do itself:
-
-* **It does not build the CP context.** ``context._build_intra_cp_context`` does,
-  which is the same call the launch path makes -- so what gets timed is the
-  partitioning that actually ships, not a copy of it that can drift. Reaching a
-  private name across the package boundary is the price of that guarantee; the
-  alternative is a second partitioner here that can silently disagree.
-* **It does not re-derive the structural features.** The fit does that from the
-  cached shape columns via ``autocp.utils.struct_features``.
-"""
 
 from __future__ import annotations
 
@@ -33,21 +16,23 @@ from flash_qla.utils import l2norm
 from flash_qla.ops.gated_delta_rule.chunk import (  # noqa: F401 -- re-exports
     CHUNK_SIZE,
     correct_initial_states,
+    correct_terminal_states,
     fused_gdr_bwd,
+    fused_gdr_dh,
     fused_gdr_fwd,
     fused_gdr_h,
     get_warmup_chunks,
+    get_warmup_chunks_bidi,
     kkt_solve,
 )
 from flash_qla.ops.gated_delta_rule.chunk.cp.context import (
     _build_intra_cp_context,
 )
-from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.utils import KERNELS
 from .utils import (
-    ShapeSpec, lcp_grid, append_cache, cache_key, read_cache,
+    MEASURED, ShapeSpec, lcp_grid, append_cache, cache_key, cache_row_complete,
+    read_cache,
 )
 
-#: Head dims the calibration runs at (the shipped kernels' configuration).
 K_DIM = V_DIM = 128
 
 _DTYPES = {"bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
@@ -63,19 +48,11 @@ def torch_dtype(name: str) -> torch.dtype:
 
 
 def bench(fn, warmup_ms: float = 25, rep_ms: float = 100) -> float:
-    """Milliseconds per call.
-
-    ``do_bench``'s ``warmup`` / ``rep`` are *target milliseconds*, not iteration
-    counts: it estimates one call, sizes the loop from that, flushes L2 between
-    reps and averages CUDA-event pairs. The first call triggers tilelang JIT and
-    can take minutes.
-    """
     return tilelang.profiler.do_bench(fn, warmup=warmup_ms, rep=rep_ms)
 
 
 def generate_inputs(T: int, Hk: int, Hv: int, dtype: torch.dtype,
                     swa_ratio: float, seed: int = 42) -> dict:
-    """One shape's inputs. Matches ``profile_inter_cp.generate_inputs``."""
     dev = "cuda"
     torch.manual_seed(seed)
     q = l2norm(torch.randn(1, T, Hk, K_DIM, device=dev, dtype=dtype))
@@ -84,8 +61,7 @@ def generate_inputs(T: int, Hk: int, Hv: int, dtype: torch.dtype,
     do = torch.randn(1, T, Hv, V_DIM, device=dev, dtype=dtype)
     g = F.logsigmoid(torch.randn(1, T, Hv, device=dev, dtype=torch.float32)) / 16
     beta = torch.randn(1, T, Hv, device=dev, dtype=torch.float32).sigmoid()
-    # SWA heads get gate 0 (no decay), the rest keep theirs -- this is what sets
-    # the warmup-length distribution, and hence ``warmup_max``.
+    # SWA heads get gate 0 (no decay); this sets the warmup-length distribution.
     swa = torch.zeros(Hv, dtype=torch.bool, device=dev)
     swa[: math.ceil(swa_ratio * Hv)] = 1
     swa = swa[torch.randperm(Hv, device=dev)]
@@ -96,14 +72,6 @@ def generate_inputs(T: int, Hk: int, Hv: int, dtype: torch.dtype,
 def measure_shape(spec: ShapeSpec, lcps, *, P: int, chunk: int = CHUNK_SIZE,
                   device: str | None = None, warmup_ms: float = 25,
                   rep_ms: float = 100, seed: int = 42) -> Iterator[dict]:
-    """Time the four kernels at each ``L_cp`` in ``lcps``. Yields cache rows.
-
-    The inputs, the gate cumsum and the KKT solve are built **once per shape**:
-    all three use the *raw* ``cu_seqlens`` and so are independent of ``L_cp``
-    (this mirrors ``chunk_gated_delta_rule_fwd``, which also computes them before
-    any CP context). Only the CP context, the warmup scan and the two untimed
-    ``fused_gdr_h`` setup calls are per-``L_cp``.
-    """
     dev = "cuda"
     if device is None:
         device = torch.cuda.get_device_name()
@@ -111,6 +79,7 @@ def measure_shape(spec: ShapeSpec, lcps, *, P: int, chunk: int = CHUNK_SIZE,
     cu_raw = torch.tensor(spec.cu, device=dev, dtype=torch.int32)
     chunks = spec.chunks(chunk)
 
+    # inputs / gate cumsum / KKT solve are per-shape (raw cu_seqlens, L_cp-independent)
     inp = generate_inputs(spec.T, spec.Hk, spec.H, dtype, spec.swa_ratio, seed)
     g_c = chunk_local_cumsum(inp["g"], cu_seqlens=cu_raw, chunk_size=chunk)
     A = kkt_solve(inp["k"], inp["beta"], cu_seqlens=cu_raw, chunk_size=chunk)
@@ -124,9 +93,14 @@ def measure_shape(spec: ShapeSpec, lcps, *, P: int, chunk: int = CHUNK_SIZE,
             g=g_c, cu_seqlens=cp_cu, ht_mask=ctx.ht_mask,
             chunk_size=chunk, threshold=-10.0,
         )
+        # Untimed: the bidi scan returns only the two elementwise maxima, so it
+        # cannot stand in for the forward-only call above (a step makes both).
+        nw_bidi, nw_bwd, _fb_fwd, fb_bwd = get_warmup_chunks_bidi(
+            g=g_c, cu_seqlens=cp_cu, ht_mask_fwd=ctx.ht_mask,
+            ht_mask_bwd=ctx.ht_mask_bwd, chunk_size=chunk, threshold=-10.0,
+        )
 
-        # Untimed setup: prepare_h's outputs feed correct_h0, whose output feeds
-        # the fused kernels, and fused_bwd needs the recomputed h states.
+        # Untimed setup feeding the timed closures below (fused_bwd needs h_states).
         _, ht, mt = fused_gdr_h(
             k=inp["k"], v=inp["v"], a=A, g=g_c, b=inp["beta"],
             initial_state=None, output_final_state=True, output_h=False,
@@ -141,12 +115,31 @@ def measure_shape(spec: ShapeSpec, lcps, *, P: int, chunk: int = CHUNK_SIZE,
             initial_state=cp_h0, output_final_state=False, output_h=True,
             cu_seqlens=cp_cu,
         )
+        _, dht_buffer = fused_gdr_dh(
+            q=inp["q"], k=inp["k"], a=A, g=g_c, b=inp["beta"], do=inp["do"],
+            dht=None, output_dh0=True, output_dh=False, scale=inp["scale"],
+            cu_seqlens=cp_cu, num_warmup_chunks=nw_bwd,
+        )
 
         def run_prepare_h():
             return fused_gdr_h(
                 k=inp["k"], v=inp["v"], a=A, g=g_c, b=inp["beta"],
                 initial_state=None, output_final_state=True, output_h=False,
                 cu_seqlens=cp_cu, num_warmup_chunks=nw,
+            )
+
+        def run_prepare_h_bidi():
+            return fused_gdr_h(
+                k=inp["k"], v=inp["v"], a=A, g=g_c, b=inp["beta"],
+                initial_state=None, output_final_state=True, output_h=False,
+                cu_seqlens=cp_cu, num_warmup_chunks=nw_bidi,
+            )
+
+        def run_recompute_h():
+            return fused_gdr_h(
+                k=inp["k"], v=inp["v"], a=A, g=g_c, b=inp["beta"],
+                initial_state=cp_h0, output_final_state=False, output_h=True,
+                cu_seqlens=cp_cu,
             )
 
         def run_correct_h0():
@@ -164,6 +157,21 @@ def measure_shape(spec: ShapeSpec, lcps, *, P: int, chunk: int = CHUNK_SIZE,
                 raw_cu_seqlens=cu_raw,
             )
 
+        def run_prepare_dh():
+            return fused_gdr_dh(
+                q=inp["q"], k=inp["k"], a=A, g=g_c, b=inp["beta"], do=inp["do"],
+                dht=None, output_dh0=True, output_dh=False, scale=inp["scale"],
+                cu_seqlens=cp_cu, num_warmup_chunks=nw_bwd,
+            )
+
+        def run_correct_dht():
+            # .float() is inside the closure on purpose: production's backward casts
+            # mt here and the forward does not -- an n_part*H*16 KB extra memory pass.
+            return correct_terminal_states(
+                raw_dht=None, dht_buffer=dht_buffer, mt_buffer=mt.float(),
+                fallback_mask=fb_bwd, seq_map_r2c=ctx.seq_map_r2c,
+            )
+
         def run_fused_bwd():
             return fused_gdr_bwd(
                 q=inp["q"], k=inp["k"], v=inp["v"], a=A, g=g_c, b=inp["beta"],
@@ -171,9 +179,17 @@ def measure_shape(spec: ShapeSpec, lcps, *, P: int, chunk: int = CHUNK_SIZE,
                 cu_seqlens=cp_cu,
             )
 
-        t = {name: bench(fn, warmup_ms, rep_ms) for name, fn in (
-            ("prepare_h", run_prepare_h), ("correct_h0", run_correct_h0),
-            ("fused_fwd", run_fused_fwd), ("fused_bwd", run_fused_bwd))}
+        closures = {
+            "prepare_h": run_prepare_h, "prepare_h_bidi": run_prepare_h_bidi,
+            "correct_h0": run_correct_h0, "correct_dht": run_correct_dht,
+            "fused_fwd": run_fused_fwd, "prepare_dh": run_prepare_dh,
+            "recompute_h": run_recompute_h, "fused_bwd": run_fused_bwd,
+        }
+        assert set(closures) == set(MEASURED), (
+            f"timed closures must cover MEASURED exactly; "
+            f"missing {sorted(set(MEASURED) - set(closures))}, "
+            f"extra {sorted(set(closures) - set(MEASURED))}")
+        t = {name: bench(closures[name], warmup_ms, rep_ms) for name in MEASURED}
 
         yield dict(
             name=spec.name, device=device, P=int(P), chunk=int(chunk),
@@ -182,20 +198,21 @@ def measure_shape(spec: ShapeSpec, lcps, *, P: int, chunk: int = CHUNK_SIZE,
             N_part=n_part, B_raw=spec.B_raw, cmax=max(chunks), cu=spec.cu_str,
             warmup_max=int(nw.max().item()),
             warmup_mean=float(nw.float().mean().item()),
+            warmup_bidi_max=int(nw_bidi.max().item()),
+            warmup_bidi_mean=float(nw_bidi.float().mean().item()),
+            warmup_bwd_max=int(nw_bwd.max().item()),
+            warmup_bwd_mean=float(nw_bwd.float().mean().item()),
             **t,
+            # Totals are over launches, not coefficient rows: correct runs twice.
             fwd_total=t["prepare_h"] + t["correct_h0"] + t["fused_fwd"],
-            all_total=sum(t[k] for k in KERNELS),
+            all_total=(t["prepare_h_bidi"] + t["correct_h0"] + t["fused_fwd"]
+                       + t["prepare_dh"] + t["correct_dht"]
+                       + t["recompute_h"] + t["fused_bwd"]),
         )
 
 
 def plan_cases(specs, *, P: int, chunk: int, ratio: float, device: str,
                cache: dict) -> tuple[list[tuple], int]:
-    """``[(spec, [lcp, ...])]`` still to measure, plus the number of cache hits.
-
-    Splitting planning from measuring is what lets ``fit`` report "N hit, M to
-    measure" before touching the GPU -- and lets ``--from-cache`` name exactly
-    which rows are missing without importing torch.
-    """
     todo, hits = [], 0
     for spec in specs:
         want = []
@@ -204,9 +221,11 @@ def plan_cases(specs, *, P: int, chunk: int, ratio: float, device: str,
                                  dtype=spec.dtype, swa_ratio=spec.swa_ratio,
                                  H=spec.H, Hk=spec.Hk, cu=spec.cu_str,
                                  L_cp=lcp))
-            if key in cache:
+            row = cache.get(key)
+            if row is not None and cache_row_complete(row):
                 hits += 1
             else:
+                # present but pre-dating a column is not usable: re-measure it.
                 want.append(lcp)
         if want:
             todo.append((spec, want))
@@ -217,13 +236,6 @@ def measure_specs(specs, *, cache_path: str, P: int, chunk: int = CHUNK_SIZE,
                   ratio: float | None = None, device: str | None = None,
                   warmup_ms: float = 25, rep_ms: float = 100, seed: int = 42,
                   verbose: bool = True) -> dict[tuple, dict]:
-    """Measure whatever the cache is missing and return the full cache.
-
-    Each row is appended and flushed as soon as it is measured. With tilelang's
-    cache warm the 141-row reference calibration takes 4.5 minutes; the first run
-    on a fresh cache is dominated by JIT and is an order of magnitude longer, so
-    an interrupted sweep has to resume rather than restart.
-    """
     from .utils import DEFAULT_LCP_RATIO
     if ratio is None:
         ratio = DEFAULT_LCP_RATIO

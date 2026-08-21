@@ -203,7 +203,7 @@ def test_cp_preprocess_bwd_raises_not_implemented():
     # Build the intra-card context explicitly, then invoke backward preprocess —
     # it must raise NotImplementedError on SM120 (no fused_gdr_dh) regardless of use_cp.
     cp_ctx = build_intra_cp_context(
-        None, k, v, A_qla.shape[-1], cu_seqlens=None, auto_cp=True, is_bwd=True,
+        None, k, v, A_qla.shape[-1], cu_seqlens=None, auto_cp=True, is_train=True,
     )
     with pytest.raises(NotImplementedError) as exc_info:
         intra_cp_preprocess_bwd(

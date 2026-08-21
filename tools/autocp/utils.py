@@ -1,22 +1,5 @@
 # Copyright (c) 2026 The Qwen team, Alibaba Group.
 # Licensed under The MIT License [see LICENSE for details]
-"""Offline-only autocp helpers: the L_cp grid, the shape CSV, the cache, the writer.
-
-The other half of this pair is ``autocp.utils`` inside the shipped package. The
-split is by *who needs it at launch time*:
-
-* **there** -- the structural features, the model form and :func:`load_coefs`.
-  ``decision.py`` calls those on the launch path, and the offline side imports
-  them from there rather than keeping a copy, which is what makes "the fit saw
-  exactly the features the decision sees" true by construction.
-* **here** -- everything only a calibration run touches: the ``L_cp`` grid it
-  sweeps, the shape CSV it reads, the measurement cache it fills, and
-  :func:`save_coefs`, the write side of a file the package only ever reads.
-
-Nothing here ships in the wheel, and nothing in ``flash_qla/`` may import it.
-**Standard library only** all the same: ``--from-cache`` refits with no GPU and
-must not pull in torch, and :mod:`.fit` is the only module allowed numpy/pandas.
-"""
 
 from __future__ import annotations
 
@@ -26,26 +9,22 @@ from dataclasses import dataclass
 
 from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.utils import (
     COEF_NAMES,
-    KERNELS,
     MIN_LCP,
+    ROWS,
     seq_chunks,
 )
 
+# Timed columns, one per call site (decoupled from ROWS, which is one per cost
+# law). ROW_SOURCES maps rows back to these.
+MEASURED = ("prepare_h", "prepare_h_bidi", "correct_h0", "correct_dht",
+            "fused_fwd", "prepare_dh", "recompute_h", "fused_bwd")
+
 
 def save_coefs(path: str, coefs: dict) -> None:
-    """Write fitted coefficients in the layout ``utils.load_coefs`` reads.
-
-    The read side lives in the package because the launch path needs it; only a
-    fit ever writes, so the writer lives out here.
-
-    ``P`` / ``chunk`` are duplicated on every row so the reader needs no separate
-    metadata parsing. A coefficient the kernel's model form does not use (``tau``
-    for ``correct_h0``) is stored empty rather than as ``0``.
-    """
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["kernel", "tau", "kappa", "c", "P", "chunk"])
-        for name in KERNELS:
+        for name in ROWS:
             k = coefs["kernels"][name]
             used = COEF_NAMES[name]
             cell = lambda c: f"{k[c]:.8g}" if c in used else ""
@@ -56,28 +35,11 @@ def save_coefs(path: str, coefs: dict) -> None:
 # ---------------------------------------------------------------------------
 # The L_cp grid
 # ---------------------------------------------------------------------------
-#: Geometric step between successive ``L_cp`` samples. 1.5 puts 13 points on a
-#: 512-chunk sequence, and deliberately lands off powers of two -- whether the
-#: measured optimum sits exactly on a pow2 is one of the things the sweep is
-#: meant to answer, so a pow2-only grid could not see it.
 DEFAULT_LCP_RATIO = 1.5
 
 
 def lcp_grid(cmax: int, ratio: float = DEFAULT_LCP_RATIO,
              min_S: int = MIN_LCP) -> list[int]:
-    """Geometric ``L_cp`` grid from ``min_S`` to ``cmax``, ending exactly on ``cmax``.
-
-    ``cmax`` is the single baseline point: every ``S >= cmax`` collapses to the
-    same no-CP shape, so sampling beyond it would re-measure one shape under
-    different labels.
-
-    A sequence too short to enable CP (``cmax <= min_S``) yields just ``[cmax]``
-    -- the baseline row alone, no CP points.
-
-    This is the *measurement* grid, not the decision's: ``decision.py`` enumerates
-    its own candidates at wave boundaries. The two are deliberately different, so
-    that the shapes the model is scored on are not the ones it was handed.
-    """
     cmax = int(cmax)
     if cmax <= min_S:
         return [cmax]
@@ -95,12 +57,6 @@ def lcp_grid(cmax: int, ratio: float = DEFAULT_LCP_RATIO,
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ShapeSpec:
-    """One calibration shape. Carries no timings and no ``L_cp``.
-
-    ``L_cp`` is not an input: it is enumerated per shape by :func:`lcp_grid`,
-    because the useful grid depends on the shape's own ``cmax``.
-    """
-
     name: str
     H: int                    # value heads
     Hk: int                   # key heads
@@ -132,7 +88,6 @@ class ShapeSpec:
 
 
 def _parse_cu(row: dict, name: str) -> tuple[int, ...]:
-    """Shape from whichever of the three accepted spellings the row uses."""
     if row.get("cu"):
         cu = [int(x) for x in str(row["cu"]).replace(",", ":").split(":")]
         if cu[0] != 0:
@@ -156,17 +111,6 @@ def _parse_cu(row: dict, name: str) -> tuple[int, ...]:
 
 def load_specs(path: str, *, Hk: int | None = None, dtype: str = "bfloat16",
                swa_ratio: float = 0.0) -> list[ShapeSpec]:
-    """Read a shape CSV.
-
-    Required: ``H`` plus one of ``cu`` / ``seqlens`` / ``seqlen`` (+ ``batch``).
-    Optional: ``name``, ``Hk`` (defaults to ``H``), ``dtype``, ``swa_ratio`` --
-    a missing optional column falls back to the argument here, so the smallest
-    usable CSV is two columns wide.
-
-    ``#`` lines are skipped, so a calibration set can say in the file itself why
-    its shapes were chosen. The checked-in sets are ``cases/train.csv`` and
-    ``cases/eval.csv`` next to this file.
-    """
     specs: list[ShapeSpec] = []
     with open(path, newline="") as f:
         rows = (ln for ln in f if not ln.lstrip().startswith("#"))
@@ -206,19 +150,16 @@ def load_specs(path: str, *, Hk: int | None = None, dtype: str = "bfloat16",
 # ---------------------------------------------------------------------------
 # Measurement cache: what sits between measuring and fitting
 # ---------------------------------------------------------------------------
-#: Cache columns. The shape / timing block keeps the names the earlier sweep
-#: scripts wrote so historical ``debug/*.csv`` stay readable side by side; the
-#: leading block is what makes a row addressable.
 CACHE_COLUMNS = (
     "name", "device", "P", "chunk", "dtype", "swa_ratio",
     "H", "Hk", "T", "Lc", "L_cp", "N_part", "B_raw", "cmax", "cu",
     "warmup_max", "warmup_mean",
-    "prepare_h", "correct_h0", "fused_fwd", "fused_bwd",
+    "warmup_bidi_max", "warmup_bidi_mean", "warmup_bwd_max", "warmup_bwd_mean",
+    *MEASURED,
     "fwd_total", "all_total",
 )
 
-#: What identifies a measurement. ``name`` is deliberately absent: relabelling a
-#: shape must not invalidate its timings.
+# name is deliberately absent: relabelling a shape must not invalidate its timings.
 CACHE_KEY_COLUMNS = ("device", "P", "chunk", "dtype", "swa_ratio",
                      "H", "Hk", "cu", "L_cp")
 
@@ -227,7 +168,6 @@ _KEY_FMT = {"P": int, "chunk": int, "H": int, "Hk": int, "L_cp": int,
 
 
 def cache_key(row: dict) -> tuple:
-    """Hashable identity of a cache row, tolerant of str/int/float spellings."""
     out = []
     for col in CACHE_KEY_COLUMNS:
         v = row[col]
@@ -237,11 +177,6 @@ def cache_key(row: dict) -> tuple:
 
 
 def read_cache(path: str) -> dict[tuple, dict]:
-    """``cache_key -> row`` for an existing cache (empty dict when absent).
-
-    Later rows win, so re-measuring by appending supersedes the old value
-    without having to rewrite the file.
-    """
     if not path or not os.path.exists(path):
         return {}
     out: dict[tuple, dict] = {}
@@ -252,38 +187,64 @@ def read_cache(path: str) -> dict[tuple, dict]:
                 raise ValueError(
                     f"{path} is not an autocp measurement cache "
                     f"(missing key columns {missing})")
-            for col in ("warmup_mean", *KERNELS, "fwd_total", "all_total"):
+            for col in ("warmup_mean", "warmup_bidi_mean", "warmup_bwd_mean",
+                        *MEASURED, "fwd_total", "all_total"):
                 if row.get(col) not in (None, ""):
                     row[col] = float(row[col])
             for col in ("H", "Hk", "T", "Lc", "L_cp", "N_part", "B_raw", "cmax",
-                        "warmup_max", "P", "chunk"):
+                        "warmup_max", "warmup_bidi_max", "warmup_bwd_max",
+                        "P", "chunk"):
                 if row.get(col) not in (None, ""):
                     row[col] = int(float(row[col]))
             out[cache_key(row)] = row
     return out
 
 
-def append_cache(path: str, row: dict) -> None:
-    """Append one measured row, writing the header if the file is new.
+def cache_row_complete(row: dict) -> bool:
+    # A row written before a column existed still parses and answers cache_key,
+    # so "key present" is not "row usable"; the planner and fit gate on this.
+    return all(isinstance(row.get(c), float) for c in MEASURED)
 
-    Appending per row (rather than once at the end) is what makes an interrupted
-    sweep resumable: a full calibration is hours of GPU time.
-    """
+
+def _cache_header(path: str) -> list[str] | None:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    with open(path, newline="") as f:
+        for header in csv.reader(f):
+            return [h.strip() for h in header]
+    return None
+
+
+def append_cache(path: str, row: dict) -> None:
+    # Per-row append (not once at the end) makes an interrupted sweep resumable.
+    # The header is validated first: the writer always uses CACHE_COLUMNS order but
+    # only writes a header for a new file, so appending to a differently-schemaed
+    # file would lay values out under the wrong column names and fit on nonsense.
     d = os.path.dirname(os.path.abspath(path))
     if d:
         os.makedirs(d, exist_ok=True)
-    new = not os.path.exists(path) or os.path.getsize(path) == 0
+    header = _cache_header(path)
+    if header is not None and header != list(CACHE_COLUMNS):
+        extra = [c for c in header if c not in CACHE_COLUMNS]
+        missing = [c for c in CACHE_COLUMNS if c not in header]
+        raise ValueError(
+            f"{path} was written under a different cache schema, so appending "
+            f"would silently write values under the wrong column names"
+            + (f"; missing {missing}" if missing else "")
+            + (f"; unexpected {extra}" if extra else "")
+            + (" (same columns, different order)"
+               if not missing and not extra else "")
+            + ". Measure into a new cache file instead.")
     with open(path, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(CACHE_COLUMNS),
                           extrasaction="ignore")
-        if new:
+        if header is None:
             w.writeheader()
         w.writerow(row)
         f.flush()
 
 
 def device_slug(name: str) -> str:
-    """Filesystem-safe device tag for the default cache path."""
     return "".join(c if c.isalnum() else "_" for c in name.strip().lower()
                    ).strip("_") or "unknown"
 

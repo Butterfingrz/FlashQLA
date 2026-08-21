@@ -2,6 +2,8 @@
 # Licensed under The MIT License [see LICENSE for details]
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.distributed as dist
 
@@ -248,10 +250,24 @@ def intra_cp_preprocess_bwd(
     ht_mask = cp_context.ht_mask
     ht_mask_bwd = cp_context.ht_mask_bwd
 
-    if cp_cache is not None:
-        # Use cached forward CP artifacts
+    use_cache = cp_cache is not None
+    if use_cache:
         cp_h0, mt_buffer, fallback_bwd, num_warmup_bwd = cp_cache
-    else:
+        # The cache was sized by the forward partitioning; everything below indexes
+        # it against this pass's. A mismatch reads past the end of cp_h0 / mt_buffer
+        # (tilelang does no bounds checking), so drop the stale cache and rebuild.
+        n_part = cp_cu_seqlens.numel() - 1
+        if cp_h0.shape[0] != n_part or mt_buffer.shape[0] != n_part:
+            warnings.warn(
+                "forward CP cache does not match the backward partitioning "
+                f"(cp_h0 {cp_h0.shape[0]} rows, mt_buffer {mt_buffer.shape[0]}, "
+                f"pass has {n_part} CP partitions); ignoring the cache and "
+                "recomputing.",
+                RuntimeWarning, stacklevel=2,
+            )
+            use_cache = False
+
+    if not use_cache:
         num_warmup_h, num_warmup_bwd, fallback_fwd, fallback_bwd = get_warmup_chunks_bidi(
             g=g, cu_seqlens=cp_cu_seqlens,
             ht_mask_fwd=ht_mask, ht_mask_bwd=ht_mask_bwd,

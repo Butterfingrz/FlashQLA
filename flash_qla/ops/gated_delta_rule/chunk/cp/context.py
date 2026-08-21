@@ -181,20 +181,20 @@ def build_cp_context(
 # ---------------------------------------------------------------------------
 # build intra-card context
 # ---------------------------------------------------------------------------
-#: Pick L_cp / CP on-off from the calibrated latency model instead of the
-#: heuristic below. Only sm_100 / sm_103 are calibrated (see
-#: ``autocp/coefs/sm100.csv``); other arches always take the heuristic.
-#: ``FLASHQLA_AUTOCP=0`` forces the heuristic everywhere.
-AUTOCP_MODEL = (ARCH in ("SM100", "SM103")
-                and os.environ.get("FLASHQLA_AUTOCP", "1") != "0")
+AUTOCP_MODEL = ARCH in ("SM100", "SM103")
 
 
 def _heuristic_intra_cp(num_chunks: list[int], H: int,
-                        is_bwd: bool) -> tuple[bool, int]:
+                        is_train: bool) -> tuple[bool, int]:
     """Original hand-tuned rule: sqrt scaling for L_cp, arch thresholds for on/off.
 
     Kept as the fallback for uncalibrated arches and as the A/B reference for
     :data:`AUTOCP_MODEL`.
+
+    One decision serves both passes of a step: ``L_cp`` (the sqrt formula) never
+    depended on the pass, and the on/off threshold now keys off ``is_train`` --
+    inference keeps the forward threshold, a training step uses the lower
+    (backward-dominated) one for *both* its passes so they never diverge.
     """
     # Latency model: T = a·L_cp + b·(B·H·Lc/P) / L_cp + c
     # Minimizing T yields the theoretical optimum: L_cp* ∝ √(B·H·Lc / P), where P = MULTI_PROCESSOR_COUNT, L_cp = max_local_chunks
@@ -216,15 +216,18 @@ def _heuristic_intra_cp(num_chunks: list[int], H: int,
     if ARCH == "SM90" or ARCH == "SM120":
         use_cp = Be * H <= 40 or (Be * H <= 56 and max(num_chunks) >= 128)
     elif ARCH in ["SM100", "SM103"]:
-        # SM100 uses separate thresholds for fwd and bwd:
-        # - bwd kernel does more work per chunk (higher arithmetic intensity), so GPU
-        #   under-utilization appears at fewer chunks (>=64 vs >=256 for fwd). It also
-        #   runs prepare_dh (fused_gdr_dh) which itself benefits from CP parallelism,
-        #   further lowering the break-even point.
-        # - fwd has two tiers: moderate head count (Be*H<=56) needs very long sequences
-        #   (>=256 chunks) to justify CP overhead; very low head count (Be*H<=32) allows
-        #   slightly shorter sequences (>=192 chunks).
-        if is_bwd:
+        # SM100 keys the on/off threshold on is_train, not on which pass this is --
+        # a training step's fwd and bwd must reach the same decision (see
+        # _calc_intra_cp_seqs):
+        # - training: the backward kernel does more work per chunk (higher arithmetic
+        #   intensity), so under-utilization appears at fewer chunks, and it runs
+        #   prepare_dh (fused_gdr_dh) which itself benefits from CP -- both lower the
+        #   break-even. Since backward dominates a step's cost, both passes use this
+        #   lower threshold.
+        # - inference (forward only): two tiers -- moderate head count (Be*H<=56) needs
+        #   very long sequences (>=256 chunks) to justify CP overhead; very low head
+        #   count (Be*H<=32) allows slightly shorter sequences (>=192 chunks).
+        if is_train:
             use_cp = Be * H <= 56 and max(num_chunks) >= 16
         else:
             use_cp = (Be * H <= 56 and max(num_chunks) >= 256) or (
@@ -312,7 +315,7 @@ def _calc_intra_cp_seqs(
     raw_cu_seqlens: torch.LongTensor,
     chunk_size: int,
     num_v_heads: int,
-    is_bwd: bool = False,
+    is_train: bool = False,
 ) -> FlashQLACPContext:
     raw_cu_seqlens_list = raw_cu_seqlens.tolist()
     seqlens = [raw_cu_seqlens_list[i + 1] - raw_cu_seqlens_list[i]
@@ -320,15 +323,13 @@ def _calc_intra_cp_seqs(
     num_chunks = [tilelang.cdiv(x, chunk_size) for x in seqlens]
 
     if AUTOCP_MODEL:
-        # The model prices both sides of the break-even, so it decides on/off and
-        # L_cp together. 'fwd' drops the fused_bwd term; the bwd context pays it.
         use_cp, max_local_chunks = autocp_decide(
             num_chunks=num_chunks, num_v_heads=num_v_heads,
-            P=MULTI_PROCESSOR_COUNT, target="all" if is_bwd else "fwd",
+            P=MULTI_PROCESSOR_COUNT, is_train=is_train,
         )
     else:
         use_cp, max_local_chunks = _heuristic_intra_cp(
-            num_chunks, num_v_heads, is_bwd)
+            num_chunks, num_v_heads, is_train)
 
     if not use_cp:
         return FlashQLACPContext(
@@ -345,8 +346,16 @@ def build_intra_cp_context(
     chunk_size: int,
     cu_seqlens: torch.Tensor | None,
     auto_cp: bool = True,
-    is_bwd: bool = False,
+    is_train: bool = False,
 ) -> "FlashQLACPContext":
+    """Build (or pass through) the intra-CP context for one pass.
+
+    ``is_train`` selects what the decision prices (a whole training step vs a lone
+    forward) and is the *only* pass-dependent flag: a step's forward and backward
+    both pass ``is_train=True`` so they reach the same ``use_cp`` / ``L_cp`` and the
+    forward's ``cp_cache`` fits the backward. Which ``ht_mask`` a pass uses is chosen
+    by the preprocess function it calls, not here -- the context always carries both.
+    """
     if cp_context is not None:
         return cp_context
 
@@ -362,7 +371,7 @@ def build_intra_cp_context(
         raw_cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         num_v_heads=num_v_heads,
-        is_bwd=is_bwd,
+        is_train=is_train,
     )
 
 
