@@ -1,13 +1,32 @@
-# autocp calibration shapes (training set).
-# One row per shape; the L_cp grid is enumerated by utils.lcp_grid, and the
-# kernel times are measured by measure.py -- neither belongs in this file.
-# Columns: name (report/regret grouping key, must be unique), H (value heads),
-# seqlens (per-sequence tokens). Hk/dtype/swa_ratio fall back to the CLI.
-name,H,seqlens
-h8,8,32768
-h32,32,32768
-h64,64,32768
-b2,16,"16384,16384"
-b4,16,"8192,8192,8192,8192"
-va,16,"4096,8192,16384"
-vb,16,"2048,4096,8192,16384"
+# autocp swa sweep (training). Each geometric shape repeated across
+# swa_ratio in {0,0.25,0.5,0.75}. swa_ratio=1.0 was also measured but is
+# excluded from the fit: with zero global heads warmup collapses to the
+# window everywhere, a prepare+correct regime the single linear law can't
+# hold (per-site MAPE blows up). See docs/autocp_swa_ratio.md. Low-u shapes
+# (short/b4/h8_b8) are kept at swa=0 only -- swa cannot bite when u<1.
+name,H,seqlens,swa_ratio
+h8,8,32768,0
+h8_s25,8,32768,0.25
+h8_s50,8,32768,0.5
+h8_s75,8,32768,0.75
+h32,32,32768,0
+h32_s25,32,32768,0.25
+h32_s50,32,32768,0.5
+h32_s75,32,32768,0.75
+h64,64,32768,0
+h64_s25,64,32768,0.25
+h64_s50,64,32768,0.5
+h64_s75,64,32768,0.75
+b2,16,"16384,16384",0
+b2_s25,16,"16384,16384",0.25
+b2_s50,16,"16384,16384",0.5
+b2_s75,16,"16384,16384",0.75
+b4,16,"8192,8192,8192,8192",0
+va,16,"4096,8192,16384",0
+va_s25,16,"4096,8192,16384",0.25
+va_s50,16,"4096,8192,16384",0.5
+va_s75,16,"4096,8192,16384",0.75
+vb,16,"2048,4096,8192,16384",0
+vb_s25,16,"2048,4096,8192,16384",0.25
+vb_s50,16,"2048,4096,8192,16384",0.5
+vb_s75,16,"2048,4096,8192,16384",0.75

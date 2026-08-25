@@ -52,7 +52,7 @@ def chunk_gated_delta_rule_fwd(
     if is_train is None:
         is_train = bool(enable_fwd_cp_cache)
 
-    # Since intra + inter is not supported, intra CP is only enabled when inter CP is not enabled. 
+    # Since intra + inter is not supported, intra CP is only enabled when inter CP is not enabled.
     if cp_context is None:
         cp_context = build_intra_cp_context(
             cp_context, k, v, CHUNK_SIZE, cu_seqlens, auto_cp=auto_cp,
@@ -184,6 +184,11 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         if use_qk_l2norm_in_kernel:
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
+
+        if cp_context is None:
+            cp_context = build_intra_cp_context(
+                cp_context, k, v, CHUNK_SIZE, cu_seqlens, g=g, auto_cp=auto_cp,
+                is_train=is_train)
 
         g, A, o, _, final_state, cp_cache = chunk_gated_delta_rule_fwd(
             q=q,

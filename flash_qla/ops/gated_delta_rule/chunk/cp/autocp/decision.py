@@ -16,6 +16,7 @@ from .utils import (
     predict_kernel,
     seq_chunks,
     struct_features,
+    warmup_from_gate_avg,
 )
 
 MAX_EVALS = 3
@@ -52,7 +53,7 @@ def wave_candidates(chunks, H: int, P: int, min_S: int = MIN_LCP):
 def decide(cu_seqlens=None, seq_lens=None, num_chunks=None, num_v_heads=None,
            coefs=None, coefs_path=None, P=None, chunk=None, margin=0.05,
            is_train=True, min_S=MIN_LCP, max_evals=MAX_EVALS, candidates=None,
-           prune=True, debug=False):
+           prune=True, debug=False, warmup_per_head=None, g=None):
     if coefs is None:
         coefs = _default_coefs(coefs_path)
     if P is None:
@@ -74,7 +75,14 @@ def decide(cu_seqlens=None, seq_lens=None, num_chunks=None, num_v_heads=None,
         raise ValueError(f"invalid sequence lengths: {chunks}")
 
     H, cmax = int(num_v_heads), max(chunks)
-    base_feat = struct_features(chunks, cmax, H, P, is_train=is_train)
+    if warmup_per_head is None:
+        if g is not None:
+            avg_per_head = g.float().mean(dim=1).reshape(-1).tolist()
+            warmup_per_head = warmup_from_gate_avg(avg_per_head, chunk)
+        else:
+            warmup_per_head = [math.inf] * H
+    feat_kw = dict(warmup_per_head=warmup_per_head, is_train=is_train)
+    base_feat = struct_features(chunks, cmax, H, P, **feat_kw)
     base_t = predict(coefs, base_feat, is_train=is_train, baseline=True)
 
     if candidates is not None:
@@ -84,7 +92,7 @@ def decide(cu_seqlens=None, seq_lens=None, num_chunks=None, num_v_heads=None,
 
     sweep, best_feat, best_t = [], None, float("inf")
     for S in cands:
-        feat = struct_features(chunks, S, H, P, is_train=is_train)
+        feat = struct_features(chunks, S, H, P, **feat_kw)
         t = predict(coefs, feat, is_train=is_train, baseline=not feat.enable_cp)
         sweep.append((S, t))
         if feat.enable_cp and t < best_t:

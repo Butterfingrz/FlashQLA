@@ -1,11 +1,19 @@
-# autocp held-out shapes: scored, never fitted. Same schema as cases_train.csv.
-# Chosen to move one axis each away from the training set: an unseen H, a longer
-# sequence, a wider batch, a raggeder varlen mix, and -- deliberately -- one
-# shape short enough (64 chunks) that CP was expected to lose, since a verdict
-# check needs a candidate for each side. It measured faster with CP on anyway.
-name,H,seqlens
-h16,16,32768
-h48_long,48,65536
-h8_b8,8,"4096,4096,4096,4096,4096,4096,4096,4096"
-va_ragged,24,"1024,7000,20000"
-short,16,4096
+# autocp held-out shapes: scored, never fitted. Held out on BOTH axes --
+# geometries absent from train, AND swa_ratio values that never appear in the
+# train grid {0,0.25,0.5,0.75}. The unseen ratios are interior (< 0.75), so this
+# tests swa *interpolation*, not the excluded degenerate corner (swa=1.0, see
+# docs/autocp_swa_ratio.md 4.1). h16/h48_long draw on the cached sensitivity
+# sweep (sens_fine.csv); va_ragged is measured fresh at its unseen ratios.
+# Low-u shapes (h8_b8, short) stay at swa=0: u<1 so swa cannot bite, and short is
+# the no-CP verdict anchor (a two-sided verdict check needs a shape per side).
+name,H,seqlens,swa_ratio
+h16_s15,16,32768,0.15
+h16_s35,16,32768,0.35
+h16_s60,16,32768,0.6
+h48_long_s10,48,65536,0.1
+h48_long_s40,48,65536,0.4
+h48_long_s65,48,65536,0.65
+va_ragged_s15,24,"1024,7000,20000",0.15
+va_ragged_s60,24,"1024,7000,20000",0.6
+h8_b8,8,"4096,4096,4096,4096,4096,4096,4096,4096",0
+short,16,4096,0

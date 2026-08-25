@@ -8,6 +8,7 @@ import heapq
 import math
 import os
 import warnings
+from collections import Counter
 from dataclasses import dataclass
 
 ROWS = ("prepare_h", "correct_h0", "correct_dht", "fused_fwd",
@@ -41,6 +42,8 @@ CP_ONLY_KERNELS = CP_ONLY_ROWS
 
 MIN_LCP = 4
 CORR_BV_SPLIT = 4
+
+WARMUP_TOL = -10.0
 
 COEFS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coefs")
 DEFAULT_COEFS_PATH = os.path.join(COEFS_DIR, "sm100.csv")
@@ -115,39 +118,6 @@ def seq_chunks(cu_seqlens, chunk: int) -> list[int]:
     return [math.ceil((cu[i + 1] - cu[i]) / chunk) for i in range(len(cu) - 1)]
 
 
-def depth_runs(chunks, S: int, warmup: int):
-    fb, pr, co = [], [], []
-    w = min(S, warmup)  # internal partitions all have depth S, so this is per-S
-    for c in chunks:
-        n = max(1, math.ceil(c / S))
-        if n > 1:
-            fb.append((S, n - 1))
-            pr.append((w, n - 1))
-        fb.append((c - S * (n - 1), 1))
-        pr.append((0, 1))
-        co.append((n, 1))
-    return fb, pr, co
-
-
-def warmup_runs(chunks, S: int, warmup: int):
-    pr_bidi, pr_bwd = [], []
-    w = min(S, warmup)
-    for c in chunks:
-        n = max(1, math.ceil(c / S))
-        if n == 1:
-            pr_bidi.append((0, 1))
-            pr_bwd.append((0, 1))
-            continue
-        rem = min(c - S * (n - 1), w)  # the ragged partition cannot warm up past
-        pr_bidi.append((w, n - 1))     # its own length
-        pr_bidi.append((rem, 1))
-        if n > 2:                      # no full-depth group exists at n == 2
-            pr_bwd.append((w, n - 2))
-        pr_bwd.append((rem, 1))
-        pr_bwd.append((0, 1))
-    return pr_bidi, pr_bwd
-
-
 def schedule_depth(runs, copies: int, P: int) -> float:
     P, copies = int(P), int(copies)
     if P < 1:
@@ -197,24 +167,61 @@ class StructFeatures:
         return self.num_partitions > self.num_raw
 
 
+def warmup_from_gate_avg(avg_per_head, chunk: int,
+                         tol: float = WARMUP_TOL) -> list[int]:
+    out: list[int] = []
+    for a in avg_per_head:
+        if a >= -1e-12:
+            out.append(math.inf)
+        else:
+            out.append(max(1, math.ceil(tol / (a * chunk))))
+    return out
+
+
 def struct_features(chunks, S: int, H: int, P: int,
-                    warmup: int | None = None,
-                    is_train: bool = False) -> StructFeatures:
-    if warmup is None:
-        warmup = S
-    fb, pr, co = depth_runs(chunks, S, warmup)
+                    warmup_per_head, is_train: bool = False) -> StructFeatures:
+    if len(warmup_per_head) != H:
+        raise ValueError(
+            f"warmup_per_head has {len(warmup_per_head)} entries, expected H={H}")
+
+    fb, co = [], []
+    for c in chunks:
+        n = max(1, math.ceil(c / S))
+        if n > 1:
+            fb.append((S, n - 1))
+        fb.append((c - S * (n - 1), 1))
+        co.append((n, 1))
     n_part = sum(n for n, _ in co)  # corr depth *is* the sequence's partition count
-    d_p_bwd = 0.0
-    if is_train:
-        pr, pr_bwd = warmup_runs(chunks, S, warmup)
-        d_p_bwd = schedule_depth(pr_bwd, H, P)
+
+    prep, bwd = [], []
+    for depth, copies in Counter(min(k, S) for k in warmup_per_head).items():
+        w = min(S, depth)
+        for c in chunks:
+            n = max(1, math.ceil(c / S))
+            if not is_train:
+                if n > 1:
+                    prep.append((w, (n - 1) * copies))
+                prep.append((0, copies))
+                continue
+            if n == 1:
+                prep.append((0, copies))
+                bwd.append((0, copies))
+                continue
+            rem = min(c - S * (n - 1), w)  # ragged partition can't warm past its len
+            prep.append((w, (n - 1) * copies))
+            prep.append((rem, copies))
+            if n > 2:
+                bwd.append((w, (n - 2) * copies))
+            bwd.append((rem, copies))
+            bwd.append((0, copies))
+
     return StructFeatures(
         S=S,
         num_raw=len(chunks),
         num_partitions=n_part,
         u=H * n_part / P,
         d_fb=schedule_depth(fb, H, P),
-        d_p=schedule_depth(pr, H, P),
+        d_p=schedule_depth(prep, 1, P),
         d_corr=schedule_depth(co, CORR_BV_SPLIT * H, P),
-        d_p_bwd=d_p_bwd,
+        d_p_bwd=schedule_depth(bwd, 1, P) if is_train else 0.0,
     )

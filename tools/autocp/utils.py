@@ -155,6 +155,7 @@ CACHE_COLUMNS = (
     "H", "Hk", "T", "Lc", "L_cp", "N_part", "B_raw", "cmax", "cu",
     "warmup_max", "warmup_mean",
     "warmup_bidi_max", "warmup_bidi_mean", "warmup_bwd_max", "warmup_bwd_mean",
+    "gate_avg",
     *MEASURED,
     "fwd_total", "all_total",
 )

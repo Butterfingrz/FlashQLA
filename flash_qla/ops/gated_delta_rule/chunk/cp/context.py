@@ -315,6 +315,7 @@ def _calc_intra_cp_seqs(
     raw_cu_seqlens: torch.LongTensor,
     chunk_size: int,
     num_v_heads: int,
+    g: torch.Tensor | None = None,
     is_train: bool = False,
 ) -> FlashQLACPContext:
     raw_cu_seqlens_list = raw_cu_seqlens.tolist()
@@ -325,7 +326,7 @@ def _calc_intra_cp_seqs(
     if AUTOCP_MODEL:
         use_cp, max_local_chunks = autocp_decide(
             num_chunks=num_chunks, num_v_heads=num_v_heads,
-            P=MULTI_PROCESSOR_COUNT, is_train=is_train,
+            P=MULTI_PROCESSOR_COUNT, chunk=chunk_size, is_train=is_train, g=g,
         )
     else:
         use_cp, max_local_chunks = _heuristic_intra_cp(
@@ -345,17 +346,10 @@ def build_intra_cp_context(
     v: torch.Tensor,
     chunk_size: int,
     cu_seqlens: torch.Tensor | None,
+    g: torch.Tensor | None = None,
     auto_cp: bool = True,
     is_train: bool = False,
 ) -> "FlashQLACPContext":
-    """Build (or pass through) the intra-CP context for one pass.
-
-    ``is_train`` selects what the decision prices (a whole training step vs a lone
-    forward) and is the *only* pass-dependent flag: a step's forward and backward
-    both pass ``is_train=True`` so they reach the same ``use_cp`` / ``L_cp`` and the
-    forward's ``cp_cache`` fits the backward. Which ``ht_mask`` a pass uses is chosen
-    by the preprocess function it calls, not here -- the context always carries both.
-    """
     if cp_context is not None:
         return cp_context
 
@@ -371,6 +365,7 @@ def build_intra_cp_context(
         raw_cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         num_v_heads=num_v_heads,
+        g=g if AUTOCP_MODEL else None,
         is_train=is_train,
     )
 

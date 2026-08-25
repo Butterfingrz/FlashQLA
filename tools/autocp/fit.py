@@ -19,6 +19,7 @@ from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.utils import (
     ROW_SOURCES,
     TRAIN_ROWS,
     struct_features,
+    warmup_from_gate_avg,
 )
 from .utils import (
     MEASURED,
@@ -145,13 +146,14 @@ def build_frame(rows, P: int, chunk: int = 64, part: str | None = None
         df["part"] = part
 
     # Features twice per row, once per mode: only the warmup depth (d_p) differs
-    # -- fwd-only for inference, bidi max for training -- kept under distinct names.
+    # -- fwd-only for inference, bidi max for training.
     args = [([int(c) for c in _chunks_of(r["cu"], chunk)],
-             int(r["L_cp"]), int(r["H"]), int(r["warmup_max"]))
+             int(r["L_cp"]), int(r["H"]),
+             warmup_from_gate_avg(_gate_avg_of(r["gate_avg"]), chunk))
             for _, r in df.iterrows()]
-    feats = [struct_features(c, S, H, P, warmup=w, is_train=False)
+    feats = [struct_features(c, S, H, P, warmup_per_head=w, is_train=False)
              for c, S, H, w in args]
-    feats_tr = [struct_features(c, S, H, P, warmup=w, is_train=True)
+    feats_tr = [struct_features(c, S, H, P, warmup_per_head=w, is_train=True)
                 for c, S, H, w in args]
 
     df["u"] = [f.u for f in feats]
@@ -182,6 +184,10 @@ def build_frame(rows, P: int, chunk: int = 64, part: str | None = None
 def _chunks_of(cu: str, chunk: int) -> list[int]:
     from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.utils import seq_chunks
     return seq_chunks([int(x) for x in str(cu).split(":")], chunk)
+
+
+def _gate_avg_of(s) -> list[float]:
+    return [float(x) for x in str(s).split(":") if x != ""]
 
 
 # ---------------------------------------------------------------------------
@@ -258,11 +264,14 @@ def decision_report(df: pd.DataFrame, coefs: dict, P: int,
     out = []
     for label, sub in df.groupby("setting", sort=True):
         H = int(sub["H"].iloc[0])
+        chunk = int(sub["chunk"].iloc[0])
         cu = [int(x) for x in str(sub["cu"].iloc[0]).split(":")]
         cp = sub[sub["cp"]]
         base = sub[~sub["cp"]]
         kw = dict(cu_seqlens=cu, num_v_heads=H, coefs=coefs, P=P, debug=True,
-                  is_train=(mode == "train"))
+                  is_train=(mode == "train"),
+                  warmup_per_head=warmup_from_gate_avg(
+                      _gate_avg_of(sub["gate_avg"].iloc[0]), chunk))
 
         rec = dict(setting=label, mode=mode)
         if "part" in sub:

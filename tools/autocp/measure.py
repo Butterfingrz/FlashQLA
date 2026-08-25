@@ -61,7 +61,6 @@ def generate_inputs(T: int, Hk: int, Hv: int, dtype: torch.dtype,
     do = torch.randn(1, T, Hv, V_DIM, device=dev, dtype=dtype)
     g = F.logsigmoid(torch.randn(1, T, Hv, device=dev, dtype=torch.float32)) / 16
     beta = torch.randn(1, T, Hv, device=dev, dtype=torch.float32).sigmoid()
-    # SWA heads get gate 0 (no decay); this sets the warmup-length distribution.
     swa = torch.zeros(Hv, dtype=torch.bool, device=dev)
     swa[: math.ceil(swa_ratio * Hv)] = 1
     swa = swa[torch.randperm(Hv, device=dev)]
@@ -83,6 +82,9 @@ def measure_shape(spec: ShapeSpec, lcps, *, P: int, chunk: int = CHUNK_SIZE,
     inp = generate_inputs(spec.T, spec.Hk, spec.H, dtype, spec.swa_ratio, seed)
     g_c = chunk_local_cumsum(inp["g"], cu_seqlens=cu_raw, chunk_size=chunk)
     A = kkt_solve(inp["k"], inp["beta"], cu_seqlens=cu_raw, chunk_size=chunk)
+
+    avg_per_head = inp["g"].float().mean(dim=1).reshape(-1).tolist()
+    gate_avg_str = ":".join(f"{a:.6g}" for a in avg_per_head)
 
     for lcp in lcps:
         ctx = _build_intra_cp_context(cu_raw, chunk, chunks, int(lcp))
@@ -202,6 +204,7 @@ def measure_shape(spec: ShapeSpec, lcps, *, P: int, chunk: int = CHUNK_SIZE,
             warmup_bidi_mean=float(nw_bidi.float().mean().item()),
             warmup_bwd_max=int(nw_bwd.max().item()),
             warmup_bwd_mean=float(nw_bwd.float().mean().item()),
+            gate_avg=gate_avg_str,
             **t,
             # Totals are over launches, not coefficient rows: correct runs twice.
             fwd_total=t["prepare_h"] + t["correct_h0"] + t["fused_fwd"],
