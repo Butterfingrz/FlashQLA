@@ -26,6 +26,7 @@ from flash_qla.ops.gated_delta_rule.chunk.cp.context import (
     _calc_inter_cp_seqs,
     _calc_intra_cp_seqs,
 )
+from flash_qla.ops.gated_delta_rule.chunk.cp.comm import pack_hm, unpack_hm
 from flash_qla.ops.gated_delta_rule.chunk.cp.preprocess import _assert_inter_intra_supported
 
 from cp_common import GRID, layout_cu_seqlens
@@ -418,3 +419,38 @@ def test_inter_intra_guard_rejects_missing_kernel():
 
 def test_inter_intra_guard_accepts_present_kernel():
     _assert_inter_intra_supported(True, True, object())
+
+
+# ===========================================================================
+# (h, M) pack & unpack
+# ===========================================================================
+_HM_DTYPES = [
+    (torch.bfloat16, torch.bfloat16),   # fwd, pure inter: `ht` / `mt`, both k.dtype
+    (torch.float32, torch.float32),     # fwd+bwd, inter+intra: aggregate outputs
+    (torch.float32, torch.bfloat16),    # bwd, pure inter: fp32 `dh` + bf16 `mt`
+]
+
+
+@pytest.mark.parametrize("h_dtype, m_dtype", _HM_DTYPES,
+                         ids=lambda d: str(d).replace("torch.", ""))
+@pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
+def test_pack_unpack_hm(h_dtype, m_dtype, state_v_first):
+    H, K, V = 4, 8, 8
+    n_cards = 3
+    h = torch.randn((H, V, K) if state_v_first else (H, K, V),
+                    device=DEV).to(h_dtype)
+    m = torch.randn((H, K, K), device=DEV).to(m_dtype)
+
+    packed = pack_hm(h, m)
+    assert packed.dtype is torch.uint8
+    assert packed.numel() == h.numel() * h.element_size() + m.numel() * m.element_size()
+
+    gathered = torch.stack([packed] * n_cards)      # stands in for the all_gather
+    h_buf, m_buf = unpack_hm(gathered, h, m)
+
+    assert h_buf.shape == (n_cards, *h.shape) and h_buf.dtype is h_dtype
+    assert m_buf.shape == (n_cards, *m.shape) and m_buf.dtype is m_dtype
+    assert h_buf.is_contiguous() and m_buf.is_contiguous()
+    for i in range(n_cards):
+        assert torch.equal(h_buf[i], h)
+        assert torch.equal(m_buf[i], m)

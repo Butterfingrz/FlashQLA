@@ -186,7 +186,7 @@ def cp_fwd(
     """One CP forward, stage by stage. ``d`` holds ``q/k/v/g/beta`` for this card."""
     q, k, v, g, beta = d["q"], d["k"], d["v"], d["g"], d["beta"]
     is_inter, is_intra = ctx.is_inter, ctx.is_intra
-    Hv, V = v.shape[2], v.shape[3]
+    Hv = v.shape[2]
     cu = ctx.cu_seqlens
     cp_cu = ctx.intra_cp_cu_seqlens if is_intra else cu
 
@@ -236,10 +236,12 @@ def cp_fwd(
                 h_seq, m_seq = ht, mt
         m_first = m_seq[0]
         with region("all_gather"):
-            hm = pack_hm(h_seq[-1].float(), m_seq[-1].float())
+            hm = pack_hm(h_seq[-1], m_seq[-1])
             ag_hm, _ = all_gather_into_tensor(hm, group=ctx.group)
             rank = dist.get_rank(group=ctx.group)
-            h_buf, m_buf = unpack_hm(ag_hm[rank - ctx.pre_num_ranks: rank + 1], V)
+            h_buf, m_buf = unpack_hm(
+                ag_hm[rank - ctx.pre_num_ranks: rank + 1], h_seq[-1], m_seq[-1]
+            )
         with region("inter_correct"):
             card_h0 = initial_state
             if not ctx.is_first_rank:
@@ -301,7 +303,7 @@ def cp_bwd(
     q, k, v, beta = d["q"], d["k"], d["v"], d["beta"]
     g_c, a = fwd.g_c, fwd.a
     is_inter, is_intra = ctx.is_inter, ctx.is_intra
-    Hg, Hv, V = k.shape[2], v.shape[2], v.shape[3]
+    Hg, Hv = k.shape[2], v.shape[2]
     cu = ctx.cu_seqlens
     cp_cu = ctx.intra_cp_cu_seqlens if is_intra else cu
 
@@ -328,7 +330,7 @@ def cp_bwd(
                 # reverse scan: per-chunk dh -> per-raw-sequence dh. The M product is
                 # the forward one (cached), so compute_m stays off.
                 dh_seq, _ = aggregate_card_state(
-                    dh, fwd.mt.float(), fwd.fallback_bwd, ctx.seq_map_r2c,
+                    dh, fwd.mt, fwd.fallback_bwd, ctx.seq_map_r2c,
                     state_v_first=state_v_first, reverse=True, transpose_m=True,
                     compute_m=False,
                 )
@@ -336,10 +338,12 @@ def cp_bwd(
                 dh_seq = dh
         N = dh_seq.shape[0]
         with region("all_gather"):
-            hm = pack_hm(dh_seq[0].float(), fwd.m_first.float())
+            hm = pack_hm(dh_seq[0], fwd.m_first)
             ag_hm, _ = all_gather_into_tensor(hm, group=ctx.group)
             rank = dist.get_rank(group=ctx.group)
-            dh_buf, m_buf = unpack_hm(ag_hm[rank: rank + 1 + ctx.post_num_ranks], V)
+            dh_buf, m_buf = unpack_hm(
+                ag_hm[rank: rank + 1 + ctx.post_num_ranks], dh_seq[0], fwd.m_first
+            )
         with region("inter_correct"):
             if dht is None and ctx.is_last_rank:
                 card_dht = None
@@ -362,7 +366,10 @@ def cp_bwd(
     if is_intra:
         with region("intra_correct"):
             cp_dht = correct_terminal_states(
-                raw_dht=card_dht, dht_buffer=dh, mt_buffer=fwd.mt.float(),
+                # No `.float()`: production (`preprocess.py`) passes `mt` as stored, so
+                # upcasting here would time a different kernel config (fp32-M instead
+                # of bf16-M) than the one it is supposed to mirror.
+                raw_dht=card_dht, dht_buffer=dh, mt_buffer=fwd.mt,
                 fallback_mask=fwd.fallback_bwd, seq_map_r2c=ctx.seq_map_r2c,
                 state_v_first=state_v_first,
             )

@@ -393,18 +393,31 @@ def test_get_warmup_chunks_bidi_agrees_with_single_on_aligned_layouts(segments):
 # ===========================================================================
 # correct_initial_states / correct_terminal_states
 # ===========================================================================
+_FWD_BUF_DTYPES = [
+    pytest.param(torch.float32, torch.float32, id="fp32"),
+    pytest.param(torch.bfloat16, torch.bfloat16, id="prod-bf16"),
+]
+_BWD_BUF_DTYPES = [
+    pytest.param(torch.float32, torch.float32, id="fp32"),
+    pytest.param(torch.float32, torch.bfloat16, id="prod-mixed"),
+]
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("segments", LAYOUTS)
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
 @pytest.mark.parametrize("use_raw_h0", [False, True], ids=["zero_seed", "raw_h0"])
 @pytest.mark.parametrize("fallback_pattern", FALLBACK_PATTERNS)
-def test_correct_initial_states(segments, state_v_first, use_raw_h0, fallback_pattern):
+@pytest.mark.parametrize("h_dtype, m_dtype", _FWD_BUF_DTYPES)
+def test_correct_initial_states(
+    segments, state_v_first, use_raw_h0, fallback_pattern, h_dtype, m_dtype
+):
     H = 4
     cu, seq_map, _, _ = _build_layout(segments, ragged_tail=False)
     n_cp = cu.shape[0] - 1
     ht, mt, fallback = _make_scan_inputs(
         seq_map, n_cp, H, state_v_first=state_v_first, fallback_pattern=fallback_pattern,
     )
+    ht, mt = ht.to(h_dtype), mt.to(m_dtype)
     raw_shape = (len(segments), H, V, K) if state_v_first else (len(segments), H, K, V)
     raw_h0 = torch.randn(raw_shape, device=DEVICE, dtype=torch.float32) if use_raw_h0 else None
 
@@ -416,6 +429,7 @@ def test_correct_initial_states(segments, state_v_first, use_raw_h0, fallback_pa
         ht, mt, fallback, seq_map, raw_h0=raw_h0, state_v_first=state_v_first,
     )
     err = _rel_max(out, ref)
+    assert out.dtype == torch.float32, "the main kernel's seed must stay fp32"
     assert err <= SCAN_RTOL, f"cp_h0 rel_max={err:.2e} > {SCAN_RTOL:g}"
 
 
@@ -424,7 +438,10 @@ def test_correct_initial_states(segments, state_v_first, use_raw_h0, fallback_pa
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
 @pytest.mark.parametrize("use_raw_dht", [False, True], ids=["zero_seed", "raw_dht"])
 @pytest.mark.parametrize("fallback_pattern", FALLBACK_PATTERNS)
-def test_correct_terminal_states(segments, state_v_first, use_raw_dht, fallback_pattern):
+@pytest.mark.parametrize("h_dtype, m_dtype", _BWD_BUF_DTYPES)
+def test_correct_terminal_states(
+    segments, state_v_first, use_raw_dht, fallback_pattern, h_dtype, m_dtype
+):
     """The backward twin: same scan, walked in reverse, with M transposed."""
     H = 4
     cu, seq_map, _, _ = _build_layout(segments, ragged_tail=False)
@@ -433,6 +450,7 @@ def test_correct_terminal_states(segments, state_v_first, use_raw_dht, fallback_
         seq_map, n_cp, H, state_v_first=state_v_first,
         fallback_pattern=fallback_pattern, seed=SEED + 1,
     )
+    dht, mt = dht.to(h_dtype), mt.to(m_dtype)
     raw_shape = (len(segments), H, V, K) if state_v_first else (len(segments), H, K, V)
     raw_dht = torch.randn(raw_shape, device=DEVICE, dtype=torch.float32) if use_raw_dht else None
 
@@ -445,6 +463,7 @@ def test_correct_terminal_states(segments, state_v_first, use_raw_dht, fallback_
         state_v_first=state_v_first, reverse=True, transpose_m=True,
     )
     err = _rel_max(out, ref)
+    assert out.dtype == torch.float32, "the main kernel's seed must stay fp32"
     assert err <= SCAN_RTOL, f"cp_dht rel_max={err:.2e} > {SCAN_RTOL:g}"
 
 

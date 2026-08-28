@@ -271,7 +271,8 @@ def tilelang_correct_h0(
     DV,
     res_dtype,
     accum_dtype,
-    buffer_dtype,
+    h_buffer_dtype,
+    m_buffer_dtype,
     seqlen_dtype,
     mask_dtype,
     use_raw_h0,
@@ -310,13 +311,16 @@ def tilelang_correct_h0(
     ):
         h_shared = T.alloc_shared(
             (block_DV, DK) if state_v_first else (DK, block_DV),
-            dtype=buffer_dtype,
+            dtype=h_buffer_dtype,
         )
+        # `hd_shared` and `m_shared` are the two operands of the M gemm, so both
+        # take *M*'s dtype, not h's: the backward feeds an fp32 `dht_buffer`
+        # alongside a bf16 `mt_buffer`, and `T.gemm` needs its operands to agree.
         hd_shared = T.alloc_shared(
             (block_DV, DK) if state_v_first else (DK, block_DV),
-            dtype=buffer_dtype,
+            dtype=m_buffer_dtype,
         )
-        m_shared = T.alloc_shared((DK, DK), dtype=buffer_dtype)
+        m_shared = T.alloc_shared((DK, DK), dtype=m_buffer_dtype)
 
         DV_start = bv * block_DV
         DV_end = (bv + 1) * block_DV
@@ -378,8 +382,8 @@ def tilelang_correct_h0(
         @T.prim_func
         def tilelang_correct_h0_kernel(
             raw_h0: T.Tensor(raw_state_shape, dtype=res_dtype),
-            ht_buffer: T.Tensor(state_shape, dtype=buffer_dtype),
-            mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=buffer_dtype),
+            ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
+            mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
             fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
             seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
             cp_h0: T.Tensor(state_shape, dtype=res_dtype),
@@ -434,8 +438,8 @@ def tilelang_correct_h0(
 
         @T.prim_func
         def tilelang_correct_h0_kernel(
-            ht_buffer: T.Tensor(state_shape, dtype=buffer_dtype),
-            mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=buffer_dtype),
+            ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
+            mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
             fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
             seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
             cp_h0: T.Tensor(state_shape, dtype=res_dtype),
@@ -510,7 +514,8 @@ def correct_initial_states(
         DV=v_head_dim,
         res_dtype=res_dtype,
         accum_dtype="float32",
-        buffer_dtype=ht_buffer.dtype,
+        h_buffer_dtype=ht_buffer.dtype,
+        m_buffer_dtype=mt_buffer.dtype,
         seqlen_dtype=seq_map_r2c.dtype,
         mask_dtype=fallback_mask.dtype,
         use_raw_h0=use_raw_h0,
@@ -574,7 +579,8 @@ def correct_terminal_states(
         DV=v_head_dim,
         res_dtype=res_dtype,
         accum_dtype="float32",
-        buffer_dtype=dht_buffer.dtype,
+        h_buffer_dtype=dht_buffer.dtype,
+        m_buffer_dtype=mt_buffer.dtype,
         seqlen_dtype=seq_map_r2c.dtype,
         mask_dtype=fallback_mask.dtype,
         use_raw_h0=use_raw_h0,

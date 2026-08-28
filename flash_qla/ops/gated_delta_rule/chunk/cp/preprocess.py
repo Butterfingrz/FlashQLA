@@ -33,18 +33,18 @@ def _assert_inter_intra_supported(is_inter, is_intra, aggregate_card_state):
 # shared inter correction: gather this card's boundary (h, M) with its neighbours and
 # correct it into a per-seq card state (fwd) / terminal grad (bwd).
 # ---------------------------------------------------------------------------
-def _inter_correct_fwd(h_seq, m_seq, initial_state, cp_context, V, state_v_first):
+def _inter_correct_fwd(h_seq, m_seq, initial_state, cp_context, state_v_first):
     """Gather per-seq (h, M) over the ``pre`` cards sharing this card's first local
     sequence and correct it; returns the per-seq card_h0 with seq[0] corrected (seq[1:]
     keep ``initial_state``). On the first rank the card_h0 is just ``initial_state``."""
     from flash_qla.ops.gated_delta_rule.chunk import correct_initial_states
 
     Hv = h_seq.shape[1]
-    hm = pack_hm(h_seq[-1].float(), m_seq[-1].float())
+    hm = pack_hm(h_seq[-1], m_seq[-1])
     ag_hm, _ = all_gather_into_tensor(hm, group=cp_context.group)
     rank = dist.get_rank(group=cp_context.group)
     pre = cp_context.pre_num_ranks
-    h_buf, m_buf = unpack_hm(ag_hm[rank - pre: rank + 1], V)
+    h_buf, m_buf = unpack_hm(ag_hm[rank - pre: rank + 1], h_seq[-1], m_seq[-1])
 
     if cp_context.is_first_rank:
         return initial_state
@@ -62,7 +62,7 @@ def _inter_correct_fwd(h_seq, m_seq, initial_state, cp_context, V, state_v_first
     return card_h0
 
 
-def _inter_correct_bwd(dh_seq, m_first, dht, cp_context, V, state_v_first):
+def _inter_correct_bwd(dh_seq, m_first, dht, cp_context, state_v_first):
     """Gather per-seq dh over the ``post`` cards sharing this card's last local
     sequence and correct it; returns the per-seq terminal grad with seq[-1] set from
     the following cards (or ``dht`` unchanged when there is nothing to correct)."""
@@ -70,11 +70,11 @@ def _inter_correct_bwd(dh_seq, m_first, dht, cp_context, V, state_v_first):
 
     Hv = dh_seq.shape[1]
     N = dh_seq.shape[0]
-    hm = pack_hm(dh_seq[0].float(), m_first.float())
+    hm = pack_hm(dh_seq[0], m_first)
     ag_hm, _ = all_gather_into_tensor(hm, group=cp_context.group)
     rank = dist.get_rank(group=cp_context.group)
     post = cp_context.post_num_ranks
-    dh_buf, m_buf = unpack_hm(ag_hm[rank: rank + 1 + post], V)
+    dh_buf, m_buf = unpack_hm(ag_hm[rank: rank + 1 + post], dh_seq[0], m_first)
 
     if dht is None and cp_context.is_last_rank:
         return None
@@ -113,7 +113,7 @@ def cp_preprocess_fwd(
         return initial_state, None
     _assert_inter_intra_supported(is_inter, is_intra, aggregate_card_state)
 
-    Hv, V = v.shape[2], v.shape[3]
+    Hv = v.shape[2]
     chunk_size = a.shape[-1]
     fallback = num_warmup_bwd = fallback_bwd = None
 
@@ -170,7 +170,7 @@ def cp_preprocess_fwd(
             )
         else:
             h_seq, m_seq = ht, mt
-        card_h0 = _inter_correct_fwd(h_seq, m_seq, initial_state, cp_context, V, state_v_first)
+        card_h0 = _inter_correct_fwd(h_seq, m_seq, initial_state, cp_context, state_v_first)
     else:
         card_h0 = initial_state
 
@@ -230,7 +230,7 @@ def cp_preprocess_bwd(
             "Only forward pass is supported on this architecture."
         )
 
-    Hv, V = v.shape[2], v.shape[3]
+    Hv = v.shape[2]
     chunk_size = a.shape[-1]
     mt = fallback = None
 
@@ -282,19 +282,19 @@ def cp_preprocess_bwd(
         if is_intra:
             # aggregate (reverse) -> per-seq dh; m_card is the fwd M product (cached).
             dh_seq, _ = aggregate_card_state(
-                dh, mt.float(), fallback, seq_map_r2c, state_v_first=state_v_first,
+                dh, mt, fallback, seq_map_r2c, state_v_first=state_v_first,
                 reverse=True, transpose_m=True, compute_m=False,
             )
         else:
             dh_seq = dh
-        card_dht = _inter_correct_bwd(dh_seq, cp_cache.m_first, dht, cp_context, V, state_v_first)
+        card_dht = _inter_correct_bwd(dh_seq, cp_cache.m_first, dht, cp_context, state_v_first)
     else:
         card_dht = dht
 
     # --- Stage 3: intra correct ---
     if is_intra:
         cp_dht = correct_terminal_states(
-            raw_dht=card_dht, dht_buffer=dh, mt_buffer=mt.float(),
+            raw_dht=card_dht, dht_buffer=dh, mt_buffer=mt,
             fallback_mask=fallback, seq_map_r2c=seq_map_r2c, state_v_first=state_v_first,
         )
     else:
