@@ -182,7 +182,8 @@ def get_lib_versions() -> Dict[str, str]:
 
 
 def prepare_tensors(
-    seqlens: List[int], h_qk: int, h_v: int, head_dim: int = HEAD_DIM
+    seqlens: List[int], h_qk: int, h_v: int, head_dim: int = HEAD_DIM,
+    swa_ratio: float = 0.75,
 ) -> Optional[Dict[str, Any]]:
     device = "cuda"
     num_seqs = len(seqlens)
@@ -232,7 +233,6 @@ def prepare_tensors(
             return None
         raise e
 
-    swa_ratio = 0.75
     swa_mask = torch.zeros(h_v, dtype=torch.bool, device=device)
     swa_mask[: math.ceil(swa_ratio * h_v)] = True
     swa_mask = swa_mask[torch.randperm(h_v, device=device)]
@@ -264,13 +264,14 @@ def bench_fwd(
     repeats: int = 5,
     auto_cp: bool = True,
     backend: str = "event",
+    swa_ratio: float = 0.75,
 ) -> Tuple[float, float, float]:
     """
     Run Forward Pass Benchmark.
     Returns: (qla_mean_ms, fi_mean_ms, fla_mean_ms)
     """
     cleanup_cuda()
-    data = prepare_tensors(seqlens, h_qk, h_v, head_dim)
+    data = prepare_tensors(seqlens, h_qk, h_v, head_dim, swa_ratio=swa_ratio)
     if data is None:
         return float("nan"), float("nan"), float("nan")
 
@@ -372,6 +373,7 @@ def bench_bwd(
     repeats: int = 100,
     auto_cp: bool = True,
     backend: str = "event",
+    swa_ratio: float = 0.75,
 ) -> Tuple[float, float]:
     """
     Run Backward Pass Benchmark.
@@ -379,7 +381,7 @@ def bench_bwd(
     """
     cleanup_cuda()
 
-    data = prepare_tensors(seqlens, h_qk, h_v, head_dim)
+    data = prepare_tensors(seqlens, h_qk, h_v, head_dim, swa_ratio=swa_ratio)
     if data is None:
         return float("nan"), float("nan")
 
@@ -489,6 +491,10 @@ def main():
     parser.add_argument("--skip-fi", action="store_true")
     parser.add_argument("--skip-fla", action="store_true")
     parser.add_argument("--no-cp", action="store_true", help="Disable chunk parallel")
+    parser.add_argument("--swa-ratio", type=float, default=0.75,
+                        help="Fraction of v heads with a decaying g; the rest get g=0 "
+                             "(full-history). 0 = every head full-history, which is the "
+                             "regime the autocp latency model is calibrated in")
     parser.add_argument("--backend", choices=["event", "cudagraph"], default="cudagraph",
                         help="Profiler backend: event (per-iter CUDA events) or cudagraph (graph replay, eliminates host dispatch overhead)")
     args = parser.parse_args()
@@ -537,6 +543,7 @@ def main():
                         repeats=args.repeats,
                         auto_cp=not args.no_cp,
                         backend=args.backend,
+                        swa_ratio=args.swa_ratio,
                     )
 
                     if math.isnan(qla_ms) and math.isnan(fla_ms):
@@ -584,6 +591,7 @@ def main():
                         repeats=args.repeats,
                         auto_cp=not args.no_cp,
                         backend=args.backend,
+                        swa_ratio=args.swa_ratio,
                     )
 
                     if math.isnan(qla_bwd_ms) and math.isnan(fla_bwd_ms):

@@ -49,11 +49,12 @@ _AUTO_CP_CONFIGS = [
 ]
 
 
-def _intra_enabled(k, v, cu_seqlens, *, is_bwd, force_intra_cp):
+def _intra_enabled(k, v, cu_seqlens, *, is_train, force_intra_cp):
     """What the context builder decides for this input -- the same cached context the
-    kernel driver will use, so the tests can assert on the path that actually ran."""
+    kernel driver will use, so the tests can assert on the path that actually ran.
+    """
     ctx = _auto_intra_cp_context(
-        k, v, cu_seqlens, CHUNK_SIZE, True, is_bwd=is_bwd, force_intra_cp=force_intra_cp,
+        k, v, cu_seqlens, CHUNK_SIZE, True, is_train, force_intra_cp=force_intra_cp,
     )
     return ctx.is_intra
 
@@ -79,7 +80,7 @@ def test_fwd_auto_cp(
         varlen, cu_seqlens_list, use_h0=True, state_v_first=state_v_first,
     )
 
-    is_intra = _intra_enabled(k, v, cu_seqlens, is_bwd=False, force_intra_cp=force_intra_cp)
+    is_intra = _intra_enabled(k, v, cu_seqlens, is_train=True, force_intra_cp=force_intra_cp)
     if force_intra_cp:
         assert is_intra, "force_intra_cp=True must enable the intra split"
 
@@ -134,7 +135,7 @@ def test_bwd_auto_cp(
         varlen, cu_seqlens_list, use_h0=True, state_v_first=state_v_first,
     )
 
-    is_intra = _intra_enabled(k, v, cu_seqlens, is_bwd=True, force_intra_cp=force_intra_cp)
+    is_intra = _intra_enabled(k, v, cu_seqlens, is_train=True, force_intra_cp=force_intra_cp)
     if force_intra_cp:
         assert is_intra, "force_intra_cp=True must enable the intra split"
 
@@ -197,9 +198,9 @@ def test_bwd_auto_cp(
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("is_bwd", [False, True], ids=["fwd", "bwd"])
-def test_auto_cp_heuristic_can_decline(is_bwd):
-    """A configuration the heuristic dislikes must come back with the split off.
+@pytest.mark.parametrize("is_train", [False, True], ids=["infer", "train"])
+def test_auto_cp_decision_can_decline(is_train):
+    """A configuration the decision dislikes must come back with the split off.
 
     This is the guard rail for the class of bug where an unconditional override makes the
     threshold logic dead code: if this ever starts returning ``True``, either the
@@ -210,10 +211,10 @@ def test_auto_cp_heuristic_can_decline(is_bwd):
     k = torch.randn(1, T, 64, 128, device=dev, dtype=torch.bfloat16)
     v = torch.randn(1, T, 64, 128, device=dev, dtype=torch.bfloat16)
     cu = torch.tensor([0, T], device=dev, dtype=torch.int32)
-    assert not _intra_enabled(k, v, cu, is_bwd=is_bwd, force_intra_cp=False), (
-        "the heuristic enabled intra CP for 64 heads over 4 chunks"
+    assert not _intra_enabled(k, v, cu, is_train=is_train, force_intra_cp=False), (
+        "the decision enabled intra CP for 64 heads over 4 chunks"
     )
-    assert _intra_enabled(k, v, cu, is_bwd=is_bwd, force_intra_cp=True)
+    assert _intra_enabled(k, v, cu, is_train=is_train, force_intra_cp=True)
 
 
 # ===========================================================================

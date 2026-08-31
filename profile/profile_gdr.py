@@ -51,30 +51,27 @@ from flash_qla.ops.gated_delta_rule.chunk import (
 from flash_qla.utils import l2norm, pack, profile
 
 
-# Low-level chunk functions require a non-null cp_context (the null->auto guard
-# now lives in the autograd Function). These wrappers build the auto intra-CP
-# context the same way the autograd Function does.
-
 def chunk_gated_delta_rule_fwd_qla(
     q, k, v, g, beta, scale=None, initial_state=None, cu_seqlens=None,
     output_final_state=True, output_h=False, auto_cp=True, state_v_first=False,
-    enable_fwd_cp_cache=False, cp_context=None,
+    enable_fwd_cp_cache=False, cp_context=None, is_train=True,
 ):
     if cp_context is None:
-        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=False)
+        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train)
     return _chunk_gdr_fwd_impl(
         q, k, v, g, beta, scale, initial_state, cu_seqlens,
         output_final_state, output_h, auto_cp, state_v_first,
-        enable_fwd_cp_cache, cp_context,
+        enable_fwd_cp_cache, cp_context, is_train,
     )
 
 
 def chunk_gated_delta_rule_bwd_qla(
     q, k, v, g, beta, A, do, dht=None, scale=None, initial_state=None,
     cu_seqlens=None, state_v_first=False, auto_cp=True, cp_cache=None, cp_context=None,
+    is_train=True,
 ):
     if cp_context is None:
-        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=True)
+        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train)
     return _chunk_gdr_bwd_impl(
         q, k, v, g, beta, A, do, dht, scale, initial_state,
         cu_seqlens, state_v_first, auto_cp, cp_cache, cp_context,

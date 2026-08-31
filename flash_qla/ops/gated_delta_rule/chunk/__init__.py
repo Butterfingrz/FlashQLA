@@ -39,18 +39,24 @@ from .cp import (
 from flash_qla.utils import input_guard
 
 
-def _auto_intra_cp_context(k, v, cu_seqlens, chunk_size, auto_cp, is_bwd,
+def _auto_intra_cp_context(k, v, cu_seqlens, chunk_size, auto_cp, is_train,
                            force_intra_cp=False):
     """Interpret the raw input and build an intra-CP context via build_cp_context.
     Intra needs the flattened varlen (batch-1) layout: a dense [B>1, T] input can't
-    use it, and a dense [1, T] input gets a cu_seqlens synthesized."""
+    use it, and a dense [1, T] input gets a cu_seqlens synthesized.
+
+    Never forwards `g`: the decision has to come out the same in a step's forward and
+    backward, and the backward only ever holds the chunk-local cumsum, not the raw
+    per-token gate. The gate-aware decision is opt-in through build_cp_context(g=...).
+    """
     enable_intra = auto_cp and k.shape[0] == 1
     cu = cu_seqlens
     if enable_intra and cu is None:
         cu = _create_cu_seqlens(k.shape[0], k.shape[1], k.device.index)
     return build_cp_context(
         cu, enable_intra=enable_intra, num_v_heads=v.shape[2],
-        chunk_size=chunk_size, is_bwd=is_bwd, force_intra_cp=force_intra_cp,
+        chunk_size=chunk_size, is_train=is_train,
+        force_intra_cp=force_intra_cp,
     )
 
 
@@ -69,7 +75,16 @@ def chunk_gated_delta_rule_fwd(
     state_v_first: bool = False,
     enable_fwd_cp_cache: bool = False,
     cp_context: FlashQLACPContext | None = None,
+    is_train: bool | None = None,
 ):
+    if is_train is None:
+        is_train = bool(enable_fwd_cp_cache)
+
+    if cp_context is None:
+        cp_context = _auto_intra_cp_context(
+            k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train,
+        )
+
     g = chunk_local_cumsum(
         g=g,
         cu_seqlens=cp_context.cu_seqlens,
@@ -136,6 +151,11 @@ def chunk_gated_delta_rule_bwd(
 
     chunk_size = A.shape[-1]
 
+    if cp_context is None:
+        cp_context = _auto_intra_cp_context(
+            k, v, cu_seqlens, chunk_size, auto_cp, is_train=True,
+        )
+
     h0, dht = cp_preprocess_bwd(
         cp_context, q=q, k=k, v=v, a=A, g=g, beta=beta, do=do, dht=dht, scale=scale,
         initial_state=initial_state,
@@ -199,6 +219,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         enable_fwd_cp_cache: bool = True,
         cp_context=None,
         force_intra_cp: bool = False,
+        is_train: bool = False,
     ):
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
@@ -208,10 +229,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         # No explicit context -> auto intra CP.
         if cp_context is None:
             cp_context = _auto_intra_cp_context(
-                k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=False,
+                k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train,
                 force_intra_cp=force_intra_cp,
             )
-
 
         g, A, o, _, final_state, cp_cache = chunk_gated_delta_rule_fwd(
             q=q,
@@ -228,6 +248,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             auto_cp=auto_cp,
             enable_fwd_cp_cache=enable_fwd_cp_cache,
             cp_context=cp_context,
+            is_train=is_train,
         )
 
         ctx.save_for_backward(q, k, q_rstd, k_rstd, v, g, beta, A, initial_state, cu_seqlens)
@@ -283,6 +304,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             None,          # enable_fwd_cp_cache
             None,          # cp_context
             None,          # force_intra_cp
+            None,          # is_train
         )
 
 
@@ -342,8 +364,10 @@ def chunk_gated_delta_rule(
             Whether to enable automatic intra-card CP. Default: `True`.
         enable_fwd_cp_cache (Optional[bool]):
             Whether to cache CP related variables during the forward pass. Default: `True`.
+            Ignored when no backward will follow (no input requires grad, or grad is
+            disabled), since nothing would ever read the cache.
         force_intra_cp (Optional[bool]):
-            Whether to bypass the intra-card CP heuristic and always split. Ignored when
+            Whether to bypass the intra-card CP decision and always split. Ignored when
             `auto_cp=False` (which disables intra CP outright) or when an explicit
             `cp_context` is passed. Intended for tests and profiling. Default: `False`.
 
@@ -415,6 +439,12 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
+    is_train = torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad
+        for t in (q, k, v, g, beta, initial_state)
+    )
+    enable_fwd_cp_cache = bool(enable_fwd_cp_cache) and is_train
+
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
@@ -431,6 +461,7 @@ def chunk_gated_delta_rule(
         enable_fwd_cp_cache,
         cp_context,
         force_intra_cp,
+        is_train,
     )
 
     return o, final_state

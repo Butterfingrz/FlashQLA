@@ -2,6 +2,7 @@
 # Licensed under The MIT License [see LICENSE for details]
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -238,10 +239,23 @@ def cp_preprocess_bwd(
     if is_intra:
         cp_cu = cp_context.intra_cp_cu_seqlens
         seq_map_r2c = cp_context.seq_map_r2c
-        if is_inter:
-            cp_h0, mt = cp_cache.h0, cp_cache.mt
-            num_warmup, fallback = cp_cache.num_warmup_bwd, cp_cache.fallback_bwd
-        elif cp_cache is not None:
+        # inter+intra has no recompute path -- the fwd cache is mandatory there.
+        use_cache = is_inter or cp_cache is not None
+        if use_cache and not is_inter:
+            # The cache was sized by the forward partitioning; everything below indexes
+            # it against this pass's. A mismatch reads past the end of h0 / mt (tilelang
+            # does no bounds checking), so drop the stale cache and rebuild.
+            n_part = cp_cu.numel() - 1
+            if cp_cache.h0.shape[0] != n_part or cp_cache.mt.shape[0] != n_part:
+                warnings.warn(
+                    "forward CP cache does not match the backward partitioning "
+                    f"(h0 {cp_cache.h0.shape[0]} rows, mt {cp_cache.mt.shape[0]}, "
+                    f"pass has {n_part} CP partitions); ignoring the cache and "
+                    "recomputing.",
+                    RuntimeWarning, stacklevel=2,
+                )
+                use_cache = False
+        if use_cache:
             cp_h0, mt = cp_cache.h0, cp_cache.mt
             num_warmup, fallback = cp_cache.num_warmup_bwd, cp_cache.fallback_bwd
         else:

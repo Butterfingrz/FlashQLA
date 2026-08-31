@@ -7,6 +7,14 @@ from collections.abc import Callable
 import torch
 import tilelang
 
+_KEY_VALUE_TYPES = (int, float, bool, str, bytes, type(None))
+
+
+def _same_key(a: Any, b: Any) -> bool:
+    if a is b:
+        return True
+    return type(a) is type(b) and isinstance(a, _KEY_VALUE_TYPES) and a == b
+
 
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """
@@ -35,8 +43,9 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
         for i, entry in enumerate(cache_entries):
             last_args, last_kwargs, last_result, is_static = entry
             if len(args) == len(last_args) and len(kwargs) == len(last_kwargs):
-                if all(a is b for a, b in zip(args, last_args)) and all(
-                    k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
+                if all(_same_key(a, b) for a, b in zip(args, last_args)) and all(
+                    k in last_kwargs and _same_key(v, last_kwargs[k])
+                    for k, v in kwargs.items()
                 ):
                     if is_capturing and not is_static:
                         cache_entries[i] = (

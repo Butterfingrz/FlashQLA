@@ -655,7 +655,7 @@ def test_warmup_kernels_accept_a_real_intra_context():
     case = C.CPCase(layout="offset", tokens_per_card=4096, num_k_heads=4, num_v_heads=4)
     inp = C.make_inputs(case, 1, DEVICE)
     ctx = C.CP_MODES["intra"].make_ctx(
-        inp.cu_g, num_v_heads=case.num_v_heads, force_intra_cp=True, is_bwd=False,
+        inp.cu_g, num_v_heads=case.num_v_heads, force_intra_cp=True, is_train=True,
     )
     assert ctx.is_intra, "expected the forced intra split"
 

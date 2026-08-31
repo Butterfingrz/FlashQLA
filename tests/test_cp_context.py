@@ -37,11 +37,11 @@ DEV = "cuda:0"
 # ===========================================================================
 # helpers
 # ===========================================================================
-def _intra_ctx(cu_list, num_v_heads=8, is_bwd=False, force_intra_cp=True):
+def _intra_ctx(cu_list, num_v_heads=8, is_train=False, force_intra_cp=True):
     cu = torch.tensor(cu_list, dtype=torch.int32, device=DEV)
     return build_cp_context(
         cu, enable_intra=True, num_v_heads=num_v_heads,
-        chunk_size=CHUNK_SIZE, is_bwd=is_bwd, force_intra_cp=force_intra_cp,
+        chunk_size=CHUNK_SIZE, is_train=is_train, force_intra_cp=force_intra_cp,
     )
 
 
@@ -94,10 +94,6 @@ def _check_intra_invariants(ctx, cu_list):
             assert seg[-1] <= seg[0], f"seq {i}: trailing segment {seg[-1]} > {seg[0]}"
             step = seg[0]
             assert step % CHUNK_SIZE == 0, f"seq {i}: split step {step} not chunk-aligned"
-            n_chunks = step // CHUNK_SIZE
-            assert n_chunks & (n_chunks - 1) == 0, (
-                f"seq {i}: split step is {n_chunks} chunks, expected a power of two"
-            )
 
 
 # ===========================================================================
@@ -118,9 +114,9 @@ _INTRA_LAYOUTS = [
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("cu_list", _INTRA_LAYOUTS, ids=lambda c: f"n{len(c) - 1}-T{c[-1]}")
-@pytest.mark.parametrize("is_bwd", [False, True], ids=["fwd", "bwd"])
-def test_intra_context_invariants(cu_list, is_bwd):
-    ctx = _intra_ctx(cu_list, is_bwd=is_bwd, force_intra_cp=True)
+@pytest.mark.parametrize("is_train", [False, True], ids=["infer", "train"])
+def test_intra_context_invariants(cu_list, is_train):
+    ctx = _intra_ctx(cu_list, is_train=is_train, force_intra_cp=True)
     _check_intra_invariants(ctx, cu_list)
     assert not ctx.is_inter
     assert ctx.num_seqs == len(cu_list) - 1

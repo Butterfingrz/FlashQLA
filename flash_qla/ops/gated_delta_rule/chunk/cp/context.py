@@ -12,6 +12,8 @@ import tilelang
 
 from flash_qla.utils import tensor_cache
 
+from .autocp import decide as autocp_decide
+
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
@@ -114,7 +116,8 @@ def build_cp_context(
     chunk_size: int | None = None,
     conv1d_kernel_size: int | None = None,
     cu_seqlens_cpu: torch.Tensor | None = None,
-    is_bwd: bool = False,
+    g: torch.Tensor | None = None,
+    is_train: bool = False,
     force_intra_cp: bool = False,
 ) -> FlashQLACPContext:
     """Unified CP-context builder over the canonical ``(cu_seqlens, num_v_heads)``.
@@ -123,12 +126,17 @@ def build_cp_context(
 
     - inter needs ``group``.
     - intra needs ``cu_seqlens`` (varlen), ``chunk_size`` and ``num_v_heads``.
-    - ``force_intra_cp`` bypasses the intra heuristic and always splits, for tests and
-      profiling that need the intra path on configurations the heuristic would skip.
-
-    Pure metadata — it takes no raw ``q/k/v`` tensors and does no batch/dense
-    interpretation. The caller (the chunk driver) turns a raw input into a varlen
-    ``cu_seqlens`` and decides ``enable_intra`` before calling here.
+    - ``is_train`` picks the intra decision's cost regime. It keys off the *step*, not
+      the pass: a training step's forward and backward must reach the same decision,
+      otherwise the two passes disagree on the partitioning.
+    - ``g`` lets the calibrated model see the per-head decay, so a gated/SWA head whose
+      warmup covers only the recent chunks is costed as such. Only read on arches where
+      :data:`AUTOCP_MODEL` holds; the heuristic ignores it. Opt-in, and not used by the
+      chunk driver's automatic path: it joins the ``tensor_cache`` key, so a caller that
+      passes a fresh ``g`` every step gets a miss every step -- one device sync per call
+      to read the gate, and no CUDA graph capture (a miss under capture asserts).
+    - ``force_intra_cp`` bypasses the intra decision and always splits, for tests and
+      profiling that need the intra path on configurations it would skip.
     """
     if enable_inter and enable_intra:
         assert group is not None and chunk_size is not None and num_v_heads is not None
@@ -140,7 +148,8 @@ def build_cp_context(
         )
         intra_ctx = _calc_intra_cp_seqs(
             raw_cu_seqlens=inter_ctx.cu_seqlens, chunk_size=chunk_size,
-            num_v_heads=num_v_heads, is_bwd=is_bwd, force_intra_cp=force_intra_cp,
+            num_v_heads=num_v_heads, g=g if AUTOCP_MODEL else None,
+            is_train=is_train, force_intra_cp=force_intra_cp,
         )
         return FlashQLACPContext(
             is_inter=True,
@@ -172,7 +181,8 @@ def build_cp_context(
         assert cu_seqlens is not None and chunk_size is not None and num_v_heads is not None
         return _calc_intra_cp_seqs(
             raw_cu_seqlens=cu_seqlens, chunk_size=chunk_size,
-            num_v_heads=num_v_heads, is_bwd=is_bwd, force_intra_cp=force_intra_cp,
+            num_v_heads=num_v_heads, g=g if AUTOCP_MODEL else None,
+            is_train=is_train, force_intra_cp=force_intra_cp,
         )
 
     return FlashQLACPContext(cu_seqlens=cu_seqlens)
@@ -246,23 +256,11 @@ def _calc_inter_cp_seqs(
 # ---------------------------------------------------------------------------
 # build intra-card context
 # ---------------------------------------------------------------------------
-@tensor_cache
-def _calc_intra_cp_seqs(
-    raw_cu_seqlens: torch.LongTensor,
-    chunk_size: int,
-    num_v_heads: int,
-    is_bwd: bool = False,
-    force_intra_cp: bool = False,
-) -> FlashQLACPContext:
-    device = raw_cu_seqlens.device
-    seqlen_dtype = raw_cu_seqlens.dtype
-    raw_cu_seqlens_list = raw_cu_seqlens.tolist()
-    raw_batch_size = len(raw_cu_seqlens_list) - 1
-    seqlens = [raw_cu_seqlens_list[i + 1] - raw_cu_seqlens_list[i] for i in range(raw_batch_size)]
-    num_chunks = [tilelang.cdiv(x, chunk_size) for x in seqlens]
+AUTOCP_MODEL = ARCH in ("SM100", "SM103")
 
-    # autocp
-    H = num_v_heads
+
+def _heuristic_intra_cp(num_chunks: list[int], H: int,
+                        is_train: bool) -> tuple[bool, int]:
     # Latency model: T = a·L_cp + b·(B·H·Lc/P) / L_cp + c
     # Minimizing T yields the theoretical optimum: L_cp* ∝ √(B·H·Lc / P), where P = MULTI_PROCESSOR_COUNT, L_cp = max_local_chunks
     # Scaled by empirical factor (3) and aligned to the nearest power of 2 for optimal SM scheduling & memory alignment.
@@ -274,7 +272,39 @@ def _calc_intra_cp_seqs(
     # Set min to 4 to ensure multi-stage pipelining in fused_gdr;
     max_local_chunks = max(max_local_chunks, 4)
 
-    use_cp = False
+    # Disable CP when sequences are too short or B * H naturally saturates SM occupancy.
+    # CP has fixed overhead (warmup + correct_initial_states) that only pays off
+    # when the longest sequence has enough chunks to amortize the cost.
+
+    Be = sum(num_chunks) / max(num_chunks)
+
+    if ARCH == "SM90" or ARCH == "SM120":
+        use_cp = Be * H <= 40 or (Be * H <= 56 and max(num_chunks) >= 128)
+    elif ARCH in ["SM100", "SM103"]:
+        if is_train:
+            use_cp = Be * H <= 56 and max(num_chunks) >= 16
+        else:
+            use_cp = (Be * H <= 56 and max(num_chunks) >= 256) or (
+                Be * H <= 32 and max(num_chunks) >= 192
+            )
+    else:
+        raise ValueError(
+            f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {_COMPUTE_VERSION}"
+        )
+
+    return use_cp, max_local_chunks
+
+
+def _build_intra_cp_context(
+    raw_cu_seqlens: torch.LongTensor,
+    chunk_size: int,
+    num_chunks: list[int],
+    max_local_chunks: int,
+) -> FlashQLACPContext:
+    device = raw_cu_seqlens.device
+    seqlen_dtype = raw_cu_seqlens.dtype
+    raw_cu_seqlens_list = raw_cu_seqlens.tolist()
+
     cp_cu_seqlens = []
     ht_mask = []
     ht_mask_bwd = []
@@ -302,58 +332,22 @@ def _calc_intra_cp_seqs(
         seq_map_r2c.append(len(cp_cu_seqlens))
     cp_cu_seqlens.append(raw_cu_seqlens_list[-1])
 
-    # Disable CP when sequences are too short or B * H naturally saturates SM occupancy.
-    # CP has fixed overhead (warmup + correct_initial_states) that only pays off
-    # when the longest sequence has enough chunks to amortize the cost.
-
-    Be = sum(num_chunks) / max(num_chunks)
-
-    if ARCH == "SM90" or ARCH == "SM120":
-        use_cp = Be * H <= 40 or (Be * H <= 56 and max(num_chunks) >= 128)
-    elif ARCH in ["SM100", "SM103"]:
-        # SM100 uses separate thresholds for fwd and bwd:
-        # - bwd kernel does more work per chunk (higher arithmetic intensity), so GPU
-        #   under-utilization appears at fewer chunks (>=64 vs >=256 for fwd). It also
-        #   runs prepare_dh (fused_gdr_dh) which itself benefits from CP parallelism,
-        #   further lowering the break-even point.
-        # - fwd has two tiers: moderate head count (Be*H<=56) needs very long sequences
-        #   (>=256 chunks) to justify CP overhead; very low head count (Be*H<=32) allows
-        #   slightly shorter sequences (>=192 chunks).
-        if is_bwd:
-            use_cp = Be * H <= 56 and max(num_chunks) >= 16
-        else:
-            use_cp = (Be * H <= 56 and max(num_chunks) >= 256) or (
-                Be * H <= 32 and max(num_chunks) >= 192
-            )
-    else:
-        raise ValueError(
-            f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {_COMPUTE_VERSION}"
-        )
-
-    # Explicit override for tests / profiling: split regardless of the heuristic.
-    use_cp = use_cp or force_intra_cp
-
-    if use_cp:
-        cp_cu_seqlens = torch.tensor(
-            cp_cu_seqlens, dtype=seqlen_dtype, device=device, requires_grad=False
-        )
-        seq_map_c2r = torch.tensor(seq_map_c2r, dtype=seqlen_dtype, device=device)
-        seq_map_r2c = torch.tensor(
-            seq_map_r2c, dtype=seqlen_dtype, device=device, requires_grad=False
-        )
-        ht_mask = torch.tensor(
-            ht_mask, dtype=torch.bool, device=device, requires_grad=False
-        )
-        ht_mask_bwd = torch.tensor(
-            ht_mask_bwd, dtype=torch.bool, device=device, requires_grad=False
-        )
-    else:
-        cp_cu_seqlens, seq_map_r2c, seq_map_c2r, ht_mask, ht_mask_bwd = (
-            None, None, None, None, None,
-        )
+    cp_cu_seqlens = torch.tensor(
+        cp_cu_seqlens, dtype=seqlen_dtype, device=device, requires_grad=False
+    )
+    seq_map_c2r = torch.tensor(seq_map_c2r, dtype=seqlen_dtype, device=device)
+    seq_map_r2c = torch.tensor(
+        seq_map_r2c, dtype=seqlen_dtype, device=device, requires_grad=False
+    )
+    ht_mask = torch.tensor(
+        ht_mask, dtype=torch.bool, device=device, requires_grad=False
+    )
+    ht_mask_bwd = torch.tensor(
+        ht_mask_bwd, dtype=torch.bool, device=device, requires_grad=False
+    )
 
     return FlashQLACPContext(
-        is_intra=use_cp,
+        is_intra=True,
         cu_seqlens=raw_cu_seqlens,
         intra_cp_cu_seqlens=cp_cu_seqlens,
         seq_map_r2c=seq_map_r2c,
@@ -361,6 +355,42 @@ def _calc_intra_cp_seqs(
         ht_mask=ht_mask,
         ht_mask_bwd=ht_mask_bwd,
     )
+
+
+@tensor_cache
+def _calc_intra_cp_seqs(
+    raw_cu_seqlens: torch.LongTensor,
+    chunk_size: int,
+    num_v_heads: int,
+    g: torch.Tensor | None = None,
+    is_train: bool = False,
+    force_intra_cp: bool = False,
+) -> FlashQLACPContext:
+    raw_cu_seqlens_list = raw_cu_seqlens.tolist()
+    seqlens = [raw_cu_seqlens_list[i + 1] - raw_cu_seqlens_list[i]
+               for i in range(len(raw_cu_seqlens_list) - 1)]
+    num_chunks = [tilelang.cdiv(x, chunk_size) for x in seqlens]
+
+    if AUTOCP_MODEL:
+        use_cp, max_local_chunks = autocp_decide(
+            num_chunks=num_chunks, num_v_heads=num_v_heads,
+            P=MULTI_PROCESSOR_COUNT, chunk=chunk_size, is_train=is_train, g=g,
+        )
+    else:
+        use_cp, max_local_chunks = _heuristic_intra_cp(
+            num_chunks, num_v_heads, is_train)
+
+    if force_intra_cp and not use_cp:
+        use_cp = True
+        if max_local_chunks is None:
+            _, max_local_chunks = _heuristic_intra_cp(
+                num_chunks, num_v_heads, is_train)
+
+    if not use_cp:
+        return FlashQLACPContext(is_intra=False, cu_seqlens=raw_cu_seqlens)
+
+    return _build_intra_cp_context(
+        raw_cu_seqlens, chunk_size, num_chunks, max_local_chunks)
 
 
 # ---------------------------------------------------------------------------

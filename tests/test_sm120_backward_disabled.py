@@ -36,23 +36,24 @@ HEAD_DIM_V = 128
 def chunk_gated_delta_rule_fwd_qla(
     q, k, v, g, beta, scale=None, initial_state=None, cu_seqlens=None,
     output_final_state=True, output_h=False, auto_cp=True, state_v_first=False,
-    enable_fwd_cp_cache=False, cp_context=None,
+    enable_fwd_cp_cache=False, cp_context=None, is_train=True,
 ):
     if cp_context is None:
-        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=False)
+        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train)
     return _chunk_gdr_fwd_impl(
         q, k, v, g, beta, scale, initial_state, cu_seqlens,
         output_final_state, output_h, auto_cp, state_v_first,
-        enable_fwd_cp_cache, cp_context,
+        enable_fwd_cp_cache, cp_context, is_train,
     )
 
 
 def chunk_gated_delta_rule_bwd_qla(
     q, k, v, g, beta, A, do, dht=None, scale=None, initial_state=None,
     cu_seqlens=None, state_v_first=False, auto_cp=True, cp_cache=None, cp_context=None,
+    is_train=True,
 ):
     if cp_context is None:
-        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_bwd=True)
+        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train)
     return _chunk_gdr_bwd_impl(
         q, k, v, g, beta, A, do, dht, scale, initial_state,
         cu_seqlens, state_v_first, auto_cp, cp_cache, cp_context,
@@ -238,7 +239,8 @@ def test_cp_preprocess_bwd_raises_not_implemented():
     # it must raise NotImplementedError on SM120 (no fused_gdr_dh) regardless of use_cp.
     cu = torch.tensor([0, v.shape[1]], dtype=torch.int32, device=v.device)
     cp_ctx = build_cp_context(
-        cu, enable_intra=True, num_v_heads=v.shape[2], chunk_size=A_qla.shape[-1], is_bwd=True,
+        cu, enable_intra=True, num_v_heads=v.shape[2], chunk_size=A_qla.shape[-1],
+        is_train=True,
     )
     with pytest.raises(NotImplementedError) as exc_info:
         cp_preprocess_bwd(

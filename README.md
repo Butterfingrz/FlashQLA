@@ -72,7 +72,7 @@ For separate forward and backward calls:
 from flash_qla import chunk_gated_delta_rule_fwd, chunk_gated_delta_rule_bwd
 
 # Forward
-g, A, o, h, final_state = chunk_gated_delta_rule_fwd(
+g, A, o, h, final_state, cp_cache = chunk_gated_delta_rule_fwd(
     q, k, v, g, beta, scale=scale, initial_state=h0, cu_seqlens=cu_seqlens
 )
 

@@ -100,10 +100,11 @@ class CPMode:
         num_v_heads: int,
         group=None,
         force_intra_cp: bool = False,
-        is_bwd: bool = False,
+        is_train: bool = False,
     ):
         """Build this mode's context. ``cu_seqlens`` is always the **global** varlen
         offsets; the inter split derives each card's local view from it."""
+
         if self.is_inter:
             assert group is not None, f"mode {self.name} needs a process group"
         return build_cp_context(
@@ -113,7 +114,7 @@ class CPMode:
             group=group,
             num_v_heads=num_v_heads,
             chunk_size=CHUNK_SIZE,
-            is_bwd=is_bwd,
+            is_train=is_train,
             force_intra_cp=force_intra_cp,
         )
 
@@ -518,6 +519,7 @@ def run_mode(
         num_v_heads=inp.case.num_v_heads,
         group=group,
         force_intra_cp=inp.case.force_intra_cp,
+        is_train=need_grad,
     )
     local = inp.slice_tensors(rank) if mode.is_inter else {
         name: getattr(inp, name) for name in ("q", "k", "v", "g", "beta")
