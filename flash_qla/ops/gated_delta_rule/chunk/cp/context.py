@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -12,24 +13,13 @@ import tilelang
 
 from flash_qla.utils import tensor_cache
 
+from .autocp import current_arch, is_calibrated
 from .autocp import decide as autocp_decide
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
-_COMPUTE_VERSION = tilelang.contrib.nvcc.get_target_compute_version()
-if _COMPUTE_VERSION == "9.0":
-    ARCH = "SM90"
-elif _COMPUTE_VERSION == "10.0":
-    ARCH = "SM100"
-elif _COMPUTE_VERSION == "10.3":
-    ARCH = "SM103"
-elif _COMPUTE_VERSION == "12.0":
-    ARCH = "SM120"
-else:
-    raise ValueError(
-        f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {_COMPUTE_VERSION}"
-    )
+ARCH = current_arch()
 
 MULTI_PROCESSOR_COUNT = torch.cuda.get_device_properties().multi_processor_count
 
@@ -256,7 +246,7 @@ def _calc_inter_cp_seqs(
 # ---------------------------------------------------------------------------
 # build intra-card context
 # ---------------------------------------------------------------------------
-AUTOCP_MODEL = ARCH in ("SM100", "SM103")
+AUTOCP_MODEL = is_calibrated(ARCH)
 
 
 def _heuristic_intra_cp(num_chunks: list[int], H: int,
@@ -278,9 +268,9 @@ def _heuristic_intra_cp(num_chunks: list[int], H: int,
 
     Be = sum(num_chunks) / max(num_chunks)
 
-    if ARCH == "SM90" or ARCH == "SM120":
+    if ARCH in ("sm90", "sm120"):
         use_cp = Be * H <= 40 or (Be * H <= 56 and max(num_chunks) >= 128)
-    elif ARCH in ["SM100", "SM103"]:
+    elif ARCH in ("sm100", "sm103"):
         if is_train:
             use_cp = Be * H <= 56 and max(num_chunks) >= 16
         else:
@@ -288,9 +278,7 @@ def _heuristic_intra_cp(num_chunks: list[int], H: int,
                 Be * H <= 32 and max(num_chunks) >= 192
             )
     else:
-        raise ValueError(
-            f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {_COMPUTE_VERSION}"
-        )
+        raise ValueError(f"no CP heuristic for {ARCH}")
 
     return use_cp, max_local_chunks
 
@@ -377,6 +365,12 @@ def _calc_intra_cp_seqs(
             P=MULTI_PROCESSOR_COUNT, chunk=chunk_size, is_train=is_train, g=g,
         )
     else:
+        warnings.warn(
+            "AUTOCP_MODEL is disabled; falling back to the heuristic intra-CP "
+            "rule instead of the calibrated autocp model. Enable AUTOCP_MODEL "
+            "for accurate CP decisions.",
+            RuntimeWarning, stacklevel=2,
+        )
         use_cp, max_local_chunks = _heuristic_intra_cp(
             num_chunks, num_v_heads, is_train)
 

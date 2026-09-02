@@ -167,10 +167,8 @@ def measure_shape(spec: ShapeSpec, lcps, *, P: int, chunk: int = CHUNK_SIZE,
             )
 
         def run_correct_dht():
-            # .float() is inside the closure on purpose: production's backward casts
-            # mt here and the forward does not -- an n_part*H*16 KB extra memory pass.
             return correct_terminal_states(
-                raw_dht=None, dht_buffer=dht_buffer, mt_buffer=mt.float(),
+                raw_dht=None, dht_buffer=dht_buffer, mt_buffer=mt,
                 fallback_mask=fb_bwd, seq_map_r2c=ctx.seq_map_r2c,
             )
 

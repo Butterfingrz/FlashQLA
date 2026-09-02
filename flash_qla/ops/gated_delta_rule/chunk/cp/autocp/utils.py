@@ -11,103 +11,125 @@ import warnings
 from collections import Counter
 from dataclasses import dataclass
 
-ROWS = ("prepare_h", "correct_h0", "correct_dht", "fused_fwd",
-        "prepare_dh", "recompute_h", "fused_bwd")
+from .launch import BACKEND_OF, LaunchShape, coef_rows, launch_config
 
-INFER_ROWS = ("prepare_h", "correct_h0", "fused_fwd")
-
-TRAIN_ROWS = ("prepare_h", "correct_h0", "fused_fwd",
-              "prepare_dh", "correct_dht", "recompute_h", "fused_bwd")
-
-CP_ONLY_ROWS = ("prepare_h", "correct_h0", "correct_dht", "prepare_dh")
-
-#: Coefficient row -> measured columns + the depth feature each fills. Offline fit only.
-ROW_SOURCES = {
-    "prepare_h":   (("prepare_h", "d_p_fwd"), ("prepare_h_bidi", "d_p_bidi")),
-    "correct_h0":  (("correct_h0", "d_corr"),),
-    "correct_dht": (("correct_dht", "d_corr"),),
-    "fused_fwd":   (("fused_fwd", "d_fb"),),
-    "prepare_dh":  (("prepare_dh", "d_p_bwd"),),
-    "recompute_h": (("recompute_h", "d_fb"),),
-    "fused_bwd":   (("fused_bwd", "d_fb"),),
+#: Kernel -> the modes that price it -> the column measure.py times it in. The
+#: membership is what INFER_KERNELS / TRAIN_KERNELS are; the columns are fit-only.
+KERNEL_SOURCES = {
+    "prepare_h":   {"infer": "prepare_h", "train": "prepare_h_bidi"},
+    "correct_h0":  {"infer": "correct_h0", "train": "correct_h0"},
+    "correct_dht": {"train": "correct_dht"},
+    "fused_fwd":   {"infer": "fused_fwd", "train": "fused_fwd"},
+    "prepare_dh":  {"train": "prepare_dh"},
+    "recompute_h": {"train": "recompute_h"},
+    "fused_bwd":   {"train": "fused_bwd"},
 }
 
-# Legacy CSVs named the pre-split shared row ``correct``; read it as ``correct_h0``.
-_ROW_ALIASES = {"correct": "correct_h0"}
+KERNELS = tuple(KERNEL_SOURCES)
+INFER_KERNELS = tuple(k for k, modes in KERNEL_SOURCES.items() if "infer" in modes)
+TRAIN_KERNELS = tuple(k for k, modes in KERNEL_SOURCES.items() if "train" in modes)
 
-# Pre-split names kept for legacy imports.
-KERNELS = ROWS
-FWD_KERNELS = INFER_ROWS
-CP_ONLY_KERNELS = CP_ONLY_ROWS
+CP_ONLY_KERNELS = ("prepare_h", "correct_h0", "correct_dht", "prepare_dh")
+
+#: Kernel -> which run list its schedule depth is a makespan of. prep/bwd launch a
+#: plain batch*H grid, fb/co are DV-tiled so their CTA count is ways * H.
+KERNEL_FAMILY = {"prepare_h": "prep", "prepare_dh": "bwd",
+                 "correct_h0": "co", "correct_dht": "co",
+                 "fused_fwd": "fb", "recompute_h": "fb", "fused_bwd": "fb"}
 
 MIN_LCP = 4
-CORR_BV_SPLIT = 4
-
 WARMUP_TOL = -10.0
 
 COEFS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coefs")
-DEFAULT_COEFS_PATH = os.path.join(COEFS_DIR, "sm100.csv")
 
-
-# ---------------------------------------------------------------------------
-# The model
-# ---------------------------------------------------------------------------
-# Per kernel, the linear terms as (StructFeatures field, coefficient name), plus
-# an implicit constant c. prepare_h's d_p is mode-dependent (fwd-only vs bidi).
-MODEL_TERMS = {
-    "prepare_h": (("d_p", "tau"), ("u", "kappa")),
-    "correct_h0": (("d_corr", "tau"), ("u", "kappa")),
-    "correct_dht": (("d_corr", "tau"), ("u", "kappa")),
-    "fused_fwd": (("d_fb", "tau"), ("u", "kappa")),
-    "prepare_dh": (("d_p_bwd", "tau"), ("u", "kappa")),
-    "recompute_h": (("d_fb", "tau"), ("u", "kappa")),
-    "fused_bwd": (("d_fb", "tau"), ("u", "kappa")),
-}
-
-#: Coefficient names in design-matrix column order, constant last.
-COEF_NAMES = {k: tuple(c for _, c in terms) + ("c",)
-              for k, terms in MODEL_TERMS.items()}
+#: Every fitted row obeys the same law: t = tau * depth + kappa * u + c.
+COEF_COLUMNS = ("tau", "kappa", "c")
 
 
 def predict_kernel(coefs: dict, feat: "StructFeatures", kernel: str) -> float:
-    k = coefs["kernels"][kernel]
-    return (sum(k[cname] * getattr(feat, fname)
-                for fname, cname in MODEL_TERMS[kernel]) + k["c"])
+    row = launch_config(coefs["backend"], kernel, feat.shape).row
+    k = coefs["kernels"][row]
+    return k["tau"] * feat.depth[kernel] + k["kappa"] * feat.u + k["c"]
 
 
-def load_coefs(path: str | None = None) -> dict:
-    path = path or DEFAULT_COEFS_PATH
+class AutocpInfo(UserWarning):
+    """Non-fatal autocp heads-up (e.g. borrowing a same-backend sibling's
+    coefficients). Subclasses UserWarning so a plain filter still silences it."""
+
+
+def coefs_path_for(arch: str) -> str | None:
+    if arch not in BACKEND_OF:
+        raise ValueError(f"unknown arch {arch!r}, expected one of {sorted(BACKEND_OF)}")
+    path = os.path.join(COEFS_DIR, f"{arch}.csv")
+    if os.path.exists(path):
+        return path
+    # A sibling on the same backend launches identically, so its rows apply; only
+    # the numbers are off. Across backends they would be meaningless.
+    for other, backend in BACKEND_OF.items():
+        if other == arch or backend != BACKEND_OF[arch]:
+            continue
+        alt = os.path.join(COEFS_DIR, f"{other}.csv")
+        if os.path.exists(alt):
+            warnings.warn(
+                f"autocp: no {arch}.csv; using {other}'s coefficients "
+                f"({backend} launches the same kernels, so the decision stays "
+                f"valid though tuned on different silicon). Fit {arch}.csv for "
+                f"exact timings.",
+                AutocpInfo, stacklevel=2,
+            )
+            return alt
+    return None
+
+
+def is_calibrated(arch: str) -> bool:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", AutocpInfo)
+        return coefs_path_for(arch) is not None
+
+
+def load_coefs(path: str | None = None, *, arch: str) -> dict:
+    explicit = path is not None
+    if path is None:
+        path = coefs_path_for(arch)
+        if path is None:
+            raise ValueError(f"autocp has no coefficients for {arch}")
+    backend = BACKEND_OF[arch]
     kernels: dict[str, dict[str, float]] = {}
     P = chunk = None
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
             name = row["kernel"].strip()
-            canon = _ROW_ALIASES.get(name, name)
-            if canon in kernels:
-                raise ValueError(
-                    f"coefficient CSV defines row {canon!r} twice "
-                    f"(second time as {name!r}): {path}")
-            entry = dict(
-                tau=float(row["tau"]) if row["tau"] else 0.0,
-                kappa=float(row["kappa"]) if row["kappa"] else 0.0,
-                c=float(row["c"]) if row["c"] else 0.0,
-            )
-            # Legacy correct_h0 put the depth coefficient in kappa (blank tau);
-            # migrate it to the unified form (kappa -> tau, no u term) loudly.
-            if canon == "correct_h0" and not row["tau"].strip() and entry["kappa"]:
-                warnings.warn(
-                    f"autocp: {path} has a legacy 'correct_h0' row (blank tau, "
-                    "depth coefficient in kappa); migrating it to the unified form "
-                    "(kappa -> tau, u term = 0). Re-fit to silence this.",
-                    RuntimeWarning, stacklevel=2,
-                )
-                entry["tau"], entry["kappa"] = entry["kappa"], 0.0
-            kernels[canon] = entry
+            if name in kernels:
+                raise ValueError(f"coefficient CSV defines row {name!r} twice: {path}")
+            tagged = row.get("arch", "").strip()
+            if tagged and tagged != arch:
+                # A borrowed same-backend sibling (auto-resolved by
+                # coefs_path_for) legitimately carries another arch tag; an
+                # explicit path or a cross-backend file is a real mixup.
+                if explicit or BACKEND_OF.get(tagged) != backend:
+                    raise ValueError(
+                        f"coefficient CSV is fitted for {tagged!r} but was "
+                        f"loaded as {arch!r}: {path}")
+            kernels[name] = {c: float(row[c]) if row.get(c) else 0.0
+                             for c in COEF_COLUMNS}
             P, chunk = int(row["P"]), int(row["chunk"])
-    missing = [k for k in INFER_ROWS if k not in kernels]
+    if P is None:
+        raise ValueError(f"coefficient CSV has no rows: {path}")
+
+    missing = [r for r in coef_rows(backend, INFER_KERNELS) if r not in kernels]
     if missing:
-        raise ValueError(f"coefficient CSV is missing rows {missing}: {path}")
-    return {"kernels": kernels, "P": P, "chunk": chunk}
+        raise ValueError(
+            f"coefficient CSV is missing rows {missing} needed on {arch} "
+            f"({backend}): {path}")
+    absent = [r for r in coef_rows(backend, KERNELS) if r not in kernels]
+    if absent:
+        warnings.warn(
+            f"autocp: {path} has no rows {absent}; training-mode decisions on "
+            f"{arch} will fall back to the heuristic path if they are priced.",
+            RuntimeWarning, stacklevel=2,
+        )
+    return {"kernels": kernels, "P": P, "chunk": chunk,
+            "arch": arch, "backend": backend}
 
 
 # ---------------------------------------------------------------------------
@@ -153,18 +175,20 @@ def schedule_depth(runs, copies: int, P: int) -> float:
 class StructFeatures:
 
     S: int
+    H: int
+    P: int
     num_raw: int          # raw sequences
     num_partitions: int   # CP partitions (== cp_batch_size)
     u: float              # G / P, with G = H * num_partitions total CTAs
-    d_fb: float           # fused_fwd / fused_bwd / recompute_h schedule depth
-    d_p: float            # prepare_h schedule depth -- forward-only warmup for
-                          # is_train=False, bidirectional (max of both) for True
-    d_corr: float         # correct schedule depth
-    d_p_bwd: float = 0.0  # prepare_dh schedule depth; 0 unless is_train
+    depth: dict           # kernel -> schedule depth under the launch it takes
 
     @property
     def enable_cp(self) -> bool:
         return self.num_partitions > self.num_raw
+
+    @property
+    def shape(self) -> LaunchShape:
+        return LaunchShape(H=self.H, n_part=self.num_partitions, P=self.P)
 
 
 def warmup_from_gate_avg(avg_per_head, chunk: int,
@@ -178,8 +202,8 @@ def warmup_from_gate_avg(avg_per_head, chunk: int,
     return out
 
 
-def struct_features(chunks, S: int, H: int, P: int,
-                    warmup_per_head, is_train: bool = False) -> StructFeatures:
+def struct_features(chunks, S: int, H: int, P: int, warmup_per_head,
+                    is_train: bool = False, *, backend: str) -> StructFeatures:
     if len(warmup_per_head) != H:
         raise ValueError(
             f"warmup_per_head has {len(warmup_per_head)} entries, expected H={H}")
@@ -215,13 +239,25 @@ def struct_features(chunks, S: int, H: int, P: int,
             bwd.append((rem, copies))
             bwd.append((0, copies))
 
+    runs = {"fb": fb, "co": co, "prep": prep, "bwd": bwd}
+    shape = LaunchShape(H=H, n_part=n_part, P=P)
+    memo: dict[tuple[str, int], float] = {}
+    depths: dict[str, float] = {}
+    for kernel, family in KERNEL_FAMILY.items():
+        if family == "bwd" and not is_train:
+            depths[kernel] = 0.0
+            continue
+        copies = (1 if family in ("prep", "bwd")
+                  else launch_config(backend, kernel, shape).ways * H)
+        key = (family, copies)
+        if key not in memo:
+            memo[key] = schedule_depth(runs[family], copies, P)
+        depths[kernel] = memo[key]
+
     return StructFeatures(
-        S=S,
+        S=S, H=H, P=P,
         num_raw=len(chunks),
         num_partitions=n_part,
         u=H * n_part / P,
-        d_fb=schedule_depth(fb, H, P),
-        d_p=schedule_depth(prep, 1, P),
-        d_corr=schedule_depth(co, CORR_BV_SPLIT * H, P),
-        d_p_bwd=schedule_depth(bwd, 1, P) if is_train else 0.0,
+        depth=depths,
     )

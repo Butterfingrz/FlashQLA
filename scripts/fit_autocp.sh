@@ -32,11 +32,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Calibration input lives outside the package (it is not shipped); only the
 # fitted coefficients land inside it.
 CASES="${ROOT}/tools/autocp/cases"
-SHIPPED="${ROOT}/flash_qla/ops/gated_delta_rule/chunk/cp/autocp/coefs/sm100.csv"
+ARCH=${ARCH:-sm100}
+SHIPPED="${ROOT}/flash_qla/ops/gated_delta_rule/chunk/cp/autocp/coefs/${ARCH}.csv"
 
 TRAIN=${TRAIN:-${CASES}/train.csv}
 EVAL=${EVAL-${CASES}/eval.csv}             # empty string disables the held-out set
-OUT=${OUT:-${ROOT}/debug/coefs_sm100.csv}
+OUT=${OUT:-${ROOT}/debug/coefs_${ARCH}.csv}
 REPORT=${REPORT-${ROOT}/debug/autocp_report.csv}
 CACHE=${CACHE:-}
 PLOT=${PLOT-}
@@ -60,12 +61,13 @@ if [ -z "${CACHE}" ] && [[ " $* " == *" --from-cache "* ]]; then
     fi
 fi
 
-ARGS=(--train "${TRAIN}" --out "${OUT}")
+ARGS=(--train "${TRAIN}" --out "${OUT}" --arch "${ARCH}")
 if [ -n "${EVAL}" ]; then ARGS+=(--eval "${EVAL}"); fi
 if [ -n "${REPORT}" ]; then ARGS+=(--report-csv "${REPORT}"); fi
 if [ -n "${CACHE}" ]; then ARGS+=(--cache "${CACHE}"); fi
 if [ -n "${PLOT}" ]; then ARGS+=(--plot "${PLOT}"); fi
 
+echo "arch:   ${ARCH}"
 echo "train:  ${TRAIN}"
 echo "eval:   ${EVAL:-(none)}"
 echo "out:    ${OUT}"

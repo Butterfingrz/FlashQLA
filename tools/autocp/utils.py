@@ -7,15 +7,15 @@ import csv
 import os
 from dataclasses import dataclass
 
+from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.launch import coef_rows
 from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.utils import (
-    COEF_NAMES,
+    COEF_COLUMNS,
+    KERNELS,
     MIN_LCP,
-    ROWS,
     seq_chunks,
 )
 
-# Timed columns, one per call site (decoupled from ROWS, which is one per cost
-# law). ROW_SOURCES maps rows back to these.
+# Timed columns, one per call site. KERNEL_SOURCES maps kernels back to these.
 MEASURED = ("prepare_h", "prepare_h_bidi", "correct_h0", "correct_dht",
             "fused_fwd", "prepare_dh", "recompute_h", "fused_bwd")
 
@@ -23,13 +23,11 @@ MEASURED = ("prepare_h", "prepare_h_bidi", "correct_h0", "correct_dht",
 def save_coefs(path: str, coefs: dict) -> None:
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["kernel", "tau", "kappa", "c", "P", "chunk"])
-        for name in ROWS:
-            k = coefs["kernels"][name]
-            used = COEF_NAMES[name]
-            cell = lambda c: f"{k[c]:.8g}" if c in used else ""
-            w.writerow([name, cell("tau"), cell("kappa"), cell("c"),
-                        coefs["P"], coefs["chunk"]])
+        w.writerow(["kernel", *COEF_COLUMNS, "P", "chunk", "arch"])
+        for row in coef_rows(coefs["backend"], KERNELS):
+            k = coefs["kernels"][row]
+            w.writerow([row, *(f"{k[c]:.8g}" for c in COEF_COLUMNS),
+                        coefs["P"], coefs["chunk"], coefs["arch"]])
 
 
 # ---------------------------------------------------------------------------

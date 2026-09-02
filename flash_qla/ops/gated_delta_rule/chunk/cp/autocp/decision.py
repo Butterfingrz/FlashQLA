@@ -6,11 +6,12 @@ from __future__ import annotations
 import functools
 import math
 
+from .launch import current_arch
 from .utils import (
-    CP_ONLY_ROWS,
-    INFER_ROWS,
+    CP_ONLY_KERNELS,
+    INFER_KERNELS,
     MIN_LCP,
-    TRAIN_ROWS,
+    TRAIN_KERNELS,
     StructFeatures,
     load_coefs,
     predict_kernel,
@@ -23,8 +24,8 @@ MAX_EVALS = 3
 
 
 @functools.lru_cache(maxsize=4)
-def _default_coefs(path: str | None) -> dict:
-    return load_coefs(path)
+def _default_coefs(path: str | None, arch: str) -> dict:
+    return load_coefs(path, arch=arch)
 
 
 # ---------------------------------------------------------------------------
@@ -32,9 +33,9 @@ def _default_coefs(path: str | None) -> dict:
 # ---------------------------------------------------------------------------
 def predict(coefs: dict, feat: StructFeatures, is_train: bool = True,
             baseline: bool = False) -> float:
-    priced = TRAIN_ROWS if is_train else INFER_ROWS
+    priced = TRAIN_KERNELS if is_train else INFER_KERNELS
     return sum(predict_kernel(coefs, feat, k) for k in priced
-               if not (baseline and k in CP_ONLY_ROWS))
+               if not (baseline and k in CP_ONLY_KERNELS))
 
 
 def wave_candidates(chunks, H: int, P: int, min_S: int = MIN_LCP):
@@ -53,9 +54,9 @@ def wave_candidates(chunks, H: int, P: int, min_S: int = MIN_LCP):
 def decide(cu_seqlens=None, seq_lens=None, num_chunks=None, num_v_heads=None,
            coefs=None, coefs_path=None, P=None, chunk=None, margin=0.05,
            is_train=True, min_S=MIN_LCP, max_evals=MAX_EVALS, candidates=None,
-           prune=True, debug=False, warmup_per_head=None, g=None):
+           prune=True, debug=False, warmup_per_head=None, g=None, arch=None):
     if coefs is None:
-        coefs = _default_coefs(coefs_path)
+        coefs = _default_coefs(coefs_path, arch or current_arch())
     if P is None:
         P = coefs["P"]
     if chunk is None:
@@ -81,7 +82,8 @@ def decide(cu_seqlens=None, seq_lens=None, num_chunks=None, num_v_heads=None,
             warmup_per_head = warmup_from_gate_avg(avg_per_head, chunk)
         else:
             warmup_per_head = [math.inf] * H
-    feat_kw = dict(warmup_per_head=warmup_per_head, is_train=is_train)
+    feat_kw = dict(warmup_per_head=warmup_per_head, is_train=is_train,
+                   backend=coefs["backend"])
     base_feat = struct_features(chunks, cmax, H, P, **feat_kw)
     base_t = predict(coefs, base_feat, is_train=is_train, baseline=True)
 

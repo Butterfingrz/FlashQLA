@@ -10,14 +10,18 @@ import numpy as np
 import pandas as pd
 
 from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.decision import decide
+from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.launch import (
+    BACKEND_OF,
+    coef_rows,
+    launch_config,
+)
 from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.utils import (
-    COEF_NAMES,
-    CP_ONLY_ROWS,
-    INFER_ROWS,
-    MODEL_TERMS,
-    ROWS,
-    ROW_SOURCES,
-    TRAIN_ROWS,
+    COEF_COLUMNS,
+    CP_ONLY_KERNELS,
+    INFER_KERNELS,
+    KERNELS,
+    KERNEL_SOURCES,
+    TRAIN_KERNELS,
     struct_features,
     warmup_from_gate_avg,
 )
@@ -32,78 +36,45 @@ from .utils import (
     save_coefs,
 )
 
-__all__ = ["build_frame", "rows_for_specs", "fit_kernel", "fit_rows", "fit_all",
+__all__ = ["build_frame", "rows_for_specs", "fit_row", "priced_rows", "fit_all",
            "mape", "accuracy_report", "decision_report", "nocp_measured",
-           "plot_fit", "main", "CP_ONLY_ROWS", "STEP_SITES", "SOURCE_OF",
+           "plot_fit", "main", "CP_ONLY_KERNELS", "STEP_SITES", "SOURCE_OF",
            "MODES"]
-
-FEATURE_COLUMNS = ("u", "d_fb", "d_p_fwd", "d_p_bidi", "d_p_bwd", "d_corr")
-
-# Measured column -> (coefficient row, depth feature column); inverse of ROW_SOURCES.
-SOURCE_OF = {col: (row, depth)
-             for row, sources in ROW_SOURCES.items()
-             for col, depth in sources}
-
-STEP_SITES = {
-    "infer": (("prepare_h", "prepare_h", "d_p_fwd"),
-              ("correct_h0", "correct_h0", "d_corr"),
-              ("fused_fwd", "fused_fwd", "d_fb")),
-    "train": (("prepare_h", "prepare_h_bidi", "d_p_bidi"),
-              ("correct_h0", "correct_h0", "d_corr"),
-              ("fused_fwd", "fused_fwd", "d_fb"),
-              ("prepare_dh", "prepare_dh", "d_p_bwd"),
-              ("correct_dht", "correct_dht", "d_corr"),
-              ("recompute_h", "recompute_h", "d_fb"),
-              ("fused_bwd", "fused_bwd", "d_fb")),
-}
 
 # The cached total each mode is scored against (written by measure.py).
 MODES = {"infer": "fwd_total", "train": "all_total"}
 
+#: Views of KERNEL_SOURCES: measured column -> the kernel it times, and the mode
+#: whose depth features it is fitted against. co/fb depths are mode-independent, so
+#: the mode that prices a kernel doubles as the mode its depth comes from.
+SOURCE_OF = {col: kernel for kernel, modes in KERNEL_SOURCES.items()
+             for col in modes.values()}
+MODE_OF = {col: mode == "train" for modes in KERNEL_SOURCES.values()
+           for mode, col in modes.items()}
+STEP_SITES = {mode: tuple((kernel, modes[mode])
+                          for kernel, modes in KERNEL_SOURCES.items()
+                          if mode in modes)
+              for mode in MODES}
 
-def _fields(row: str, source) -> list[str]:
-    depth_field = MODEL_TERMS[row][0][0]
-    _, depth_col = source
-    return [depth_col if field == depth_field else field
-            for field, _ in MODEL_TERMS[row]]
+FEATURE_COLUMNS = ("u", *(f"d_{col}" for col in MEASURED))
 
 
 def _check_taxonomy() -> None:
-    for row, sources in ROW_SOURCES.items():
-        if row not in MODEL_TERMS:
-            raise AssertionError(f"ROW_SOURCES row {row!r} has no MODEL_TERMS entry")
-        for col, depth in sources:
-            if col not in MEASURED:
-                raise AssertionError(f"row {row!r} names unmeasured column {col!r}")
-            for field in _fields(row, (col, depth)):
-                if field not in FEATURE_COLUMNS:
-                    raise AssertionError(
-                        f"row {row!r} source {col!r} needs feature {field!r}, "
-                        f"which build_frame does not produce")
-    if set(ROW_SOURCES) != set(ROWS):
-        raise AssertionError("ROW_SOURCES and ROWS name different rows")
     if set(SOURCE_OF) != set(MEASURED):
         raise AssertionError(
-            f"every measured column must fit exactly one row; "
+            f"every measured column must belong to exactly one kernel; "
             f"unclaimed {sorted(set(MEASURED) - set(SOURCE_OF))}")
-    for mode, sites in STEP_SITES.items():
-        want = {"infer": INFER_ROWS, "train": TRAIN_ROWS}[mode]
-        if tuple(r for r, _, _ in sites) != tuple(want):
-            raise AssertionError(f"STEP_SITES[{mode!r}] does not match {want}")
-        for row, col, depth in sites:
-            if (col, depth) not in ROW_SOURCES[row]:
-                raise AssertionError(
-                    f"STEP_SITES[{mode!r}] uses source ({col!r}, {depth!r}), "
-                    f"which is not one of row {row!r}'s")
-    if set(MODES) != set(STEP_SITES):
-        raise AssertionError("MODES and STEP_SITES name different modes")
+    stray = {m for modes in KERNEL_SOURCES.values() for m in modes} - set(MODES)
+    if stray:
+        raise AssertionError(f"KERNEL_SOURCES names modes {sorted(stray)} that "
+                             f"MODES does not: {sorted(MODES)}")
 
 
 _check_taxonomy()
 
 
-def fit_rows(df: pd.DataFrame, row: str) -> pd.DataFrame:
-    return df[df["cp"]] if row in CP_ONLY_ROWS else df
+def priced_rows(df: pd.DataFrame, kernel: str) -> pd.DataFrame:
+    return df[df["cp"]] if kernel in CP_ONLY_KERNELS else df
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +102,8 @@ def rows_for_specs(cache: dict, specs, *, P: int, chunk: int, ratio: float,
     return rows
 
 
-def build_frame(rows, P: int, chunk: int = 64, part: str | None = None
-                ) -> pd.DataFrame:
+def build_frame(rows, P: int, chunk: int = 64, part: str | None = None,
+                *, backend: str) -> pd.DataFrame:
     df = pd.DataFrame(list(rows))
     if df.empty:
         raise ValueError("no measured rows")
@@ -140,24 +111,24 @@ def build_frame(rows, P: int, chunk: int = 64, part: str | None = None
     if part is not None:
         df["part"] = part
 
-    # Features twice per row, once per mode: only the warmup depth (d_p) differs
+    # Features twice per row, once per mode: only the warmup depths differ
     # -- fwd-only for inference, bidi max for training.
     args = [([int(c) for c in _chunks_of(r["cu"], chunk)],
              int(r["L_cp"]), int(r["H"]),
              warmup_from_gate_avg(_gate_avg_of(r["gate_avg"]), chunk))
             for _, r in df.iterrows()]
-    feats = [struct_features(c, S, H, P, warmup_per_head=w, is_train=False)
-             for c, S, H, w in args]
-    feats_tr = [struct_features(c, S, H, P, warmup_per_head=w, is_train=True)
-                for c, S, H, w in args]
+    feats = [struct_features(c, S, H, P, warmup_per_head=w, is_train=False,
+                             backend=backend) for c, S, H, w in args]
+    feats_tr = [struct_features(c, S, H, P, warmup_per_head=w, is_train=True,
+                                backend=backend) for c, S, H, w in args]
 
     df["u"] = [f.u for f in feats]
-    df["d_fb"] = [f.d_fb for f in feats]
-    df["d_p_fwd"] = [f.d_p for f in feats]
-    df["d_p_bidi"] = [f.d_p for f in feats_tr]
-    df["d_p_bwd"] = [f.d_p_bwd for f in feats_tr]
-    df["d_corr"] = [f.d_corr for f in feats]
     df["cp"] = [f.enable_cp for f in feats]
+    for col, is_train in MODE_OF.items():
+        kernel = SOURCE_OF[col]
+        fs = feats_tr if is_train else feats
+        df[f"d_{col}"] = [f.depth[kernel] for f in fs]
+        df[f"row_{col}"] = [launch_config(backend, kernel, f.shape).row for f in fs]
     missing = [c for c in FEATURE_COLUMNS if c not in df]
     if missing:
         raise AssertionError(f"build_frame did not produce {missing}")
@@ -188,16 +159,37 @@ def _gate_avg_of(s) -> list[float]:
 # ---------------------------------------------------------------------------
 # Least squares
 # ---------------------------------------------------------------------------
-def _design(df: pd.DataFrame, row: str, source):
-    X = np.stack([df[f].to_numpy(float) for f in _fields(row, source)]
-                 + [np.ones(len(df))], axis=1)
-    return X, df[source[0]].to_numpy(float)
+def _design(df: pd.DataFrame, col: str):
+    X = np.stack([df[f"d_{col}"].to_numpy(float), df["u"].to_numpy(float),
+                  np.ones(len(df))], axis=1)
+    return X, df[col].to_numpy(float)
 
 
-def fit_kernel(df: pd.DataFrame, row: str, settings=None) -> np.ndarray:
+def _row_blocks(df: pd.DataFrame, row: str):
+    """(X, y) per measured column whose launch routes that column to `row`."""
+    blocks = []
+    for col, kernel in SOURCE_OF.items():
+        sub = priced_rows(df, kernel)
+        sub = sub[sub[f"row_{col}"] == row]
+        if len(sub):
+            blocks.append(_design(sub, col))
+    return blocks
+
+
+def row_counts(df: pd.DataFrame, backend: str) -> dict[str, int]:
+    return {row: sum(len(y) for _, y in _row_blocks(df, row))
+            for row in coef_rows(backend, KERNELS)}
+
+
+def fit_row(df: pd.DataFrame, row: str, settings=None) -> np.ndarray:
     sub = df if settings is None else df[df["setting"].isin(settings)]
-    sub = fit_rows(sub, row)
-    blocks = [_design(sub, row, s) for s in ROW_SOURCES[row]]
+    blocks = _row_blocks(sub, row)
+    n = sum(len(y) for _, y in blocks)
+    if n < len(COEF_COLUMNS) + 1:
+        raise SystemExit(
+            f"row {row!r} has only {n} measurement(s) to fit "
+            f"{len(COEF_COLUMNS)} coefficients. Widen the shape set (or the "
+            f"L_cp grid) so both sides of its launch rule are covered.")
     X = np.concatenate([b[0] for b in blocks], axis=0)
     y = np.concatenate([b[1] for b in blocks], axis=0)
     coef, *_ = np.linalg.lstsq(X, y, rcond=None)
@@ -205,21 +197,20 @@ def fit_kernel(df: pd.DataFrame, row: str, settings=None) -> np.ndarray:
     return coef
 
 
-def fit_all(df: pd.DataFrame, P: int, chunk: int = 64) -> dict:
-    kernels = {}
-    for k in ROWS:
-        coef = fit_kernel(df, k)
-        packed = dict(tau=0.0, kappa=0.0, c=0.0)
-        packed.update(zip(COEF_NAMES[k], (float(x) for x in coef)))
-        kernels[k] = packed
-    return {"kernels": kernels, "P": int(P), "chunk": int(chunk)}
+def fit_all(df: pd.DataFrame, P: int, chunk: int = 64, *, arch: str) -> dict:
+    backend = BACKEND_OF[arch]
+    kernels = {row: dict(zip(COEF_COLUMNS,
+                             (float(x) for x in fit_row(df, row))))
+               for row in coef_rows(backend, KERNELS)}
+    return {"kernels": kernels, "P": int(P), "chunk": int(chunk),
+            "arch": arch, "backend": backend}
 
 
-def _predict_column(coefs: dict, df: pd.DataFrame, row: str,
-                    source) -> np.ndarray:
-    X, _ = _design(df, row, source)
-    vec = np.array([coefs["kernels"][row][c] for c in COEF_NAMES[row]])
-    return X @ vec
+def _predict_column(coefs: dict, df: pd.DataFrame, col: str) -> np.ndarray:
+    X, _ = _design(df, col)
+    C = np.array([[coefs["kernels"][r][c] for c in COEF_COLUMNS]
+                  for r in df[f"row_{col}"]])
+    return (X * C).sum(axis=1)
 
 
 def mape(y: np.ndarray, yhat: np.ndarray, mask) -> float:
@@ -236,20 +227,20 @@ def accuracy_report(df: pd.DataFrame, coefs: dict) -> pd.DataFrame:
     keys = (["part", "setting"] if "part" in df else ["setting"])
     out = []
     for col in MEASURED:
-        row, depth = SOURCE_OF[col]
+        kernel = SOURCE_OF[col]
         y = df[col].to_numpy(float)
-        yhat = _predict_column(coefs, df, row, (col, depth))
-        priced = df.index.isin(fit_rows(df, row).index)
+        yhat = _predict_column(coefs, df, col)
+        priced = df.index.isin(priced_rows(df, kernel).index)
         for vals, g in df.groupby(keys, sort=False):
             vals = vals if isinstance(vals, tuple) else (vals,)
             sel = df.index.isin(g.index) & priced
-            out.append({**dict(zip(keys, vals)), "site": col, "row": row,
+            out.append({**dict(zip(keys, vals)), "site": col, "kernel": kernel,
                         "mape": mape(y, yhat, sel), "n_fit": int(sel.sum())})
     return pd.DataFrame(out).sort_values([*keys, "site"], kind="stable")
 
 
 def nocp_measured(base_rows: pd.DataFrame, mode: str = "train") -> float:
-    cols = [c for r, c, _ in STEP_SITES[mode] if r not in CP_ONLY_ROWS]
+    cols = [c for k, c in STEP_SITES[mode] if k not in CP_ONLY_KERNELS]
     return float(sum(base_rows[c].iloc[0] for c in cols))
 
 
@@ -335,10 +326,9 @@ def _parts(df: pd.DataFrame) -> pd.Series:
 
 def _totals(coefs: dict, df: pd.DataFrame, mode: str = "train"):
     sites = STEP_SITES[mode]
-    base_sites = tuple(s for s in sites if s[0] not in CP_ONLY_ROWS)
-    meas = lambda ss: df[[c for _, c, _ in ss]].sum(axis=1).to_numpy(float)
-    pred = lambda ss: sum(_predict_column(coefs, df, r, (c, d))
-                          for r, c, d in ss)
+    base_sites = tuple(s for s in sites if s[0] not in CP_ONLY_KERNELS)
+    meas = lambda ss: df[[c for _, c in ss]].sum(axis=1).to_numpy(float)
+    pred = lambda ss: sum(_predict_column(coefs, df, c) for _, c in ss)
     cp = df["cp"].to_numpy(bool)
     return (np.where(cp, meas(sites), meas(base_sites)),
             np.where(cp, pred(sites), pred(base_sites)))
@@ -407,10 +397,10 @@ def _plot_parity(plt, matplotlib, df: pd.DataFrame, coefs: dict,
                             squeeze=False)
     parts = _parts(df).to_numpy()
     for ax, k in zip(axes.ravel(), MEASURED):
-        row, depth = SOURCE_OF[k]
-        priced = df.index.isin(fit_rows(df, row).index)
+        kernel = SOURCE_OF[k]
+        priced = df.index.isin(priced_rows(df, kernel).index)
         y = df[k].to_numpy(float)
-        yhat = _predict_column(coefs, df, row, (k, depth))
+        yhat = _predict_column(coefs, df, k)
         tags = []
         # eval drawn hollow and on top so it isn't buried under the train points
         for part, style in (
@@ -429,8 +419,8 @@ def _plot_parity(plt, matplotlib, df: pd.DataFrame, coefs: dict,
             ax.plot([lo, hi], [lo * f, hi * f], "k--", lw=.6, alpha=.45)
         ax.set(xscale="log", yscale="log", xlim=(lo, hi), ylim=(lo, hi),
                xlabel="measured (ms)", ylabel="predicted (ms)",
-               title=f"{k}   [row {row}, d={depth}]\n"
-                     f"MAPE  {'   '.join(tags)}")
+               title=f"{k}   [{', '.join(sorted(df.loc[priced, f'row_{k}'].unique()))}]"
+                     f"\nMAPE  {'   '.join(tags)}")
         ax.title.set_fontsize(10)
         for axis in (ax.xaxis, ax.yaxis):  # log minor labels collide otherwise
             axis.set_minor_formatter(matplotlib.ticker.NullFormatter())
@@ -495,6 +485,9 @@ def main() -> None:
         description="fit the autocp latency model from shape CSVs "
                     "(measuring the kernels as needed)")
     ap.add_argument("--train", required=True, help="training shape CSV")
+    ap.add_argument("--arch", required=True, choices=sorted(BACKEND_OF),
+                    help="architecture these coefficients are for; picks the "
+                         "backend whose block_DV rules route the fitted rows")
     ap.add_argument("--eval", dest="eval_path", default=None,
                     help="held-out shape CSV (accuracy + decision quality only)")
     ap.add_argument("--out", default=None, help="output coefficient CSV")
@@ -554,6 +547,7 @@ def main() -> None:
         cache_path = default_cache_path(device)
         cache = read_cache(cache_path)
 
+    backend = BACKEND_OF[args.arch]
     specs = [s for _, g in groups for s in g]
     if args.from_cache:
         print(f"cache: {cache_path} ({len(cache)} rows, measuring disabled)")
@@ -571,7 +565,7 @@ def main() -> None:
     for part, g in groups:
         rows = rows_for_specs(cache, g, P=P, chunk=args.chunk,
                               ratio=args.lcp_ratio, device=device)
-        df = build_frame(rows, P, args.chunk, part=part)
+        df = build_frame(rows, P, args.chunk, part=part, backend=backend)
         frames.append(df)
         print(f"{part + ':':6s} {len(g)} shapes, {len(df)} rows "
               f"({int(df['cp'].sum())} CP, "
@@ -579,16 +573,15 @@ def main() -> None:
     train = frames[0]
     allrows = pd.concat(frames, ignore_index=True)
 
-    coefs = fit_all(train, P, args.chunk)
-    print(f"\n=== coefficients (P={P}, chunk={args.chunk}) ===")
+    coefs = fit_all(train, P, args.chunk, arch=args.arch)
+    counts = row_counts(train, backend)
+    print(f"\n=== coefficients ({args.arch}/{backend}, P={P}, "
+          f"chunk={args.chunk}) ===")
     print(f"fitted on train only; baseline rows held out of "
-          f"{', '.join(CP_ONLY_ROWS)}")
-    for k in ROWS:
-        c = coefs["kernels"][k]
-        cell = lambda n: (f"{c[n]:.7f}" if n in COEF_NAMES[k] else "     --    ")
-        srcs = ", ".join(col for col, _ in ROW_SOURCES[k])
-        print(f"  {k:11s} tau={cell('tau')}  kappa={cell('kappa')}  "
-              f"c={c['c']:.6f}   <- {srcs}")
+          f"{', '.join(CP_ONLY_KERNELS)}")
+    for row, c in coefs["kernels"].items():
+        print(f"  {row:17s} tau={c['tau']:.7f}  kappa={c['kappa']:.7f}  "
+              f"c={c['c']:.6f}   n={counts[row]}")
 
     acc = accuracy_report(allrows, coefs)
     print("\n=== MAPE% per setting x call site (rows that price it) ===")
