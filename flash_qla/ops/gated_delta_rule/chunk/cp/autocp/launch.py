@@ -58,10 +58,22 @@ _BLACKWELL_FWD = Rule(
     lambda shape: 128 if shape.grid >= int(FWD_TARGET_FRAC * shape.P) else 64,
 )
 
+
+def _hopper_fwd_pick(shape: LaunchShape) -> int:
+    target = int(FWD_TARGET_FRAC * shape.P)
+    if shape.grid >= target:
+        return 128
+    if shape.grid * 2 >= target:
+        return 64
+    return 32
+
+
+_HOPPER_FWD = Rule((32, 64, 128), _hopper_fwd_pick)
+
 BLOCK_DV = {
     "hopper": {
-        "fused_fwd": 128,                            # hopper/fused_fwd.py:731
-        "correct_h0": 32, "correct_dht": 32,         # hopper/cp_fwd.py:282
+        "fused_fwd": _HOPPER_FWD,                    # hopper/fused_fwd.py:730-736
+        "correct_h0": 128, "correct_dht": 128,       # hopper/cp_fwd.py:302-304
     },
     "blackwell": {
         "fused_fwd": _BLACKWELL_FWD,
