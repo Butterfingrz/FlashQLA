@@ -19,6 +19,7 @@ from flash_qla import (
     chunk_gated_delta_rule_fwd as qla_fwd,
     chunk_gated_delta_rule_bwd as qla_bwd,
 )
+from flash_qla.ops.gated_delta_rule.chunk import CHUNK_SIZE, build_cp_context
 from flash_qla.utils import l2norm
 
 try:
@@ -279,6 +280,10 @@ def bench_fwd(
     h0, scale, cu_seqlens = data["h0"], data["scale"], data["cu_seqlens"]
 
     results = {}
+    cp_context = build_cp_context(
+        cu_seqlens, enable_intra=auto_cp, num_v_heads=h_v,
+        chunk_size=CHUNK_SIZE, g=g, is_train=False,
+    )
 
     def call_qla_fwd():
         qla_fwd(
@@ -292,7 +297,7 @@ def bench_fwd(
             output_final_state=True,
             output_h=False,
             cu_seqlens=cu_seqlens,
-            auto_cp=auto_cp,
+            cp_context=cp_context,
         )
 
     try:
@@ -391,8 +396,12 @@ def bench_bwd(
 
     g_cumsum = None
     A = None
+    cp_cache = None
 
-    # Pre-run FWD to get intermediates
+    cp_context = build_cp_context(
+        cu_seqlens, enable_intra=auto_cp, num_v_heads=h_v,
+        chunk_size=CHUNK_SIZE, g=g, is_train=True,
+    )
     try:
         result = qla_fwd(
             q,
@@ -405,10 +414,12 @@ def bench_bwd(
             output_final_state=True,
             output_h=False,
             cu_seqlens=cu_seqlens,
-            auto_cp=auto_cp,
+            cp_context=cp_context,
+            enable_fwd_cp_cache=True,
         )
         if isinstance(result, tuple) and len(result) >= 2:
             g_cumsum, A = result[0], result[1]
+            cp_cache = result[5] if len(result) > 5 else None
         else:
             raise RuntimeError("FlashQLA FWD did not return expected intermediates")
     except RuntimeError as e:
@@ -431,7 +442,8 @@ def bench_bwd(
             scale=scale,
             initial_state=h0,
             cu_seqlens=cu_seqlens,
-            auto_cp=auto_cp,
+            cp_context=cp_context,
+            cp_cache=cp_cache,
         )
 
     try:
