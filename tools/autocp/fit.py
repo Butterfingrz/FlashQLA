@@ -5,76 +5,51 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
-from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.decision import decide
 from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.launch import (
     BACKEND_OF,
     coef_rows,
+    current_arch,
     launch_config,
 )
 from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.utils import (
     COEF_COLUMNS,
-    CP_ONLY_KERNELS,
-    INFER_KERNELS,
     KERNELS,
-    KERNEL_SOURCES,
-    TRAIN_KERNELS,
+    seq_chunks,
     struct_features,
     warmup_from_gate_avg,
 )
 from .utils import (
+    CP_ONLY_KERNELS,
+    DEFAULT_LCP_RATIO,
+    FEATURE_COLUMNS,
     MEASURED,
-    cache_key,
+    MODE_OF,
+    MODES,
+    SOURCE_OF,
     cache_row_complete,
+    case_key,
     default_cache_path,
+    default_coefs_path,
+    depth_col,
+    design,
     lcp_grid,
     load_specs,
-    read_cache,
+    parse_gate_avg,
+    priced_rows,
+    row_col,
     save_coefs,
+    shipped_coefs_path,
 )
+from .measure import measure_specs
+from .plots import ensure_matplotlib, plot_fit
+from .reports import accuracy_report, decision_report
 
-__all__ = ["build_frame", "rows_for_specs", "fit_row", "priced_rows", "fit_all",
-           "mape", "accuracy_report", "decision_report", "nocp_measured",
-           "plot_fit", "main", "CP_ONLY_KERNELS", "STEP_SITES", "SOURCE_OF",
-           "MODES"]
-
-# The cached total each mode is scored against (written by measure.py).
-MODES = {"infer": "fwd_total", "train": "all_total"}
-
-#: Views of KERNEL_SOURCES: measured column -> the kernel it times, and the mode
-#: whose depth features it is fitted against. co/fb depths are mode-independent, so
-#: the mode that prices a kernel doubles as the mode its depth comes from.
-SOURCE_OF = {col: kernel for kernel, modes in KERNEL_SOURCES.items()
-             for col in modes.values()}
-MODE_OF = {col: mode == "train" for modes in KERNEL_SOURCES.values()
-           for mode, col in modes.items()}
-STEP_SITES = {mode: tuple((kernel, modes[mode])
-                          for kernel, modes in KERNEL_SOURCES.items()
-                          if mode in modes)
-              for mode in MODES}
-
-FEATURE_COLUMNS = ("u", *(f"d_{col}" for col in MEASURED))
-
-
-def _check_taxonomy() -> None:
-    if set(SOURCE_OF) != set(MEASURED):
-        raise AssertionError(
-            f"every measured column must belong to exactly one kernel; "
-            f"unclaimed {sorted(set(MEASURED) - set(SOURCE_OF))}")
-    stray = {m for modes in KERNEL_SOURCES.values() for m in modes} - set(MODES)
-    if stray:
-        raise AssertionError(f"KERNEL_SOURCES names modes {sorted(stray)} that "
-                             f"MODES does not: {sorted(MODES)}")
-
-
-_check_taxonomy()
-
-
-def priced_rows(df: pd.DataFrame, kernel: str) -> pd.DataFrame:
-    return df[df["cp"]] if kernel in CP_ONLY_KERNELS else df
+__all__ = ["build_frame", "rows_for_specs", "fit_row", "fit_all", "main"]
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +60,7 @@ def rows_for_specs(cache: dict, specs, *, P: int, chunk: int, ratio: float,
     rows, missing = [], []
     for spec in specs:
         for lcp in lcp_grid(spec.cmax(chunk), ratio):
-            key = cache_key(dict(device=device, P=P, chunk=chunk,
-                                 dtype=spec.dtype, swa_ratio=spec.swa_ratio,
-                                 H=spec.H, Hk=spec.Hk, cu=spec.cu_str,
-                                 L_cp=lcp))
+            key = case_key(spec, lcp, P=P, chunk=chunk, device=device)
             row = cache.get(key)
             if row is None or not cache_row_complete(row):
                 missing.append((spec.name, lcp))
@@ -98,7 +70,8 @@ def rows_for_specs(cache: dict, specs, *, P: int, chunk: int, ratio: float,
         raise SystemExit(
             f"{len(missing)} measurement(s) missing or incomplete in the cache "
             f"(a row is incomplete when any of {len(MEASURED)} timed columns is "
-            f"absent), e.g. {missing[:6]}. Drop --from-cache to measure them.")
+            f"absent), e.g. {missing[:6]}. Re-run with --refresh-cache to "
+            f"re-measure them.")
     return rows
 
 
@@ -113,9 +86,9 @@ def build_frame(rows, P: int, chunk: int = 64, part: str | None = None,
 
     # Features twice per row, once per mode: only the warmup depths differ
     # -- fwd-only for inference, bidi max for training.
-    args = [([int(c) for c in _chunks_of(r["cu"], chunk)],
+    args = [(seq_chunks([int(x) for x in str(r["cu"]).split(":")], chunk),
              int(r["L_cp"]), int(r["H"]),
-             warmup_from_gate_avg(_gate_avg_of(r["gate_avg"]), chunk))
+             warmup_from_gate_avg(parse_gate_avg(r["gate_avg"]), chunk))
             for _, r in df.iterrows()]
     feats = [struct_features(c, S, H, P, warmup_per_head=w, is_train=False,
                              backend=backend) for c, S, H, w in args]
@@ -127,8 +100,8 @@ def build_frame(rows, P: int, chunk: int = 64, part: str | None = None,
     for col, is_train in MODE_OF.items():
         kernel = SOURCE_OF[col]
         fs = feats_tr if is_train else feats
-        df[f"d_{col}"] = [f.depth[kernel] for f in fs]
-        df[f"row_{col}"] = [launch_config(backend, kernel, f.shape).row for f in fs]
+        df[depth_col(col)] = [f.depth[kernel] for f in fs]
+        df[row_col(col)] = [launch_config(backend, kernel, f.shape).row for f in fs]
     missing = [c for c in FEATURE_COLUMNS if c not in df]
     if missing:
         raise AssertionError(f"build_frame did not produce {missing}")
@@ -147,32 +120,17 @@ def build_frame(rows, P: int, chunk: int = 64, part: str | None = None,
     return df
 
 
-def _chunks_of(cu: str, chunk: int) -> list[int]:
-    from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.utils import seq_chunks
-    return seq_chunks([int(x) for x in str(cu).split(":")], chunk)
-
-
-def _gate_avg_of(s) -> list[float]:
-    return [float(x) for x in str(s).split(":") if x != ""]
-
-
 # ---------------------------------------------------------------------------
 # Least squares
 # ---------------------------------------------------------------------------
-def _design(df: pd.DataFrame, col: str):
-    X = np.stack([df[f"d_{col}"].to_numpy(float), df["u"].to_numpy(float),
-                  np.ones(len(df))], axis=1)
-    return X, df[col].to_numpy(float)
-
-
 def _row_blocks(df: pd.DataFrame, row: str):
     """(X, y) per measured column whose launch routes that column to `row`."""
     blocks = []
     for col, kernel in SOURCE_OF.items():
         sub = priced_rows(df, kernel)
-        sub = sub[sub[f"row_{col}"] == row]
+        sub = sub[sub[row_col(col)] == row]
         if len(sub):
-            blocks.append(_design(sub, col))
+            blocks.append(design(sub, col))
     return blocks
 
 
@@ -206,294 +164,69 @@ def fit_all(df: pd.DataFrame, P: int, chunk: int = 64, *, arch: str) -> dict:
             "arch": arch, "backend": backend}
 
 
-def _predict_column(coefs: dict, df: pd.DataFrame, col: str) -> np.ndarray:
-    X, _ = _design(df, col)
-    C = np.array([[coefs["kernels"][r][c] for c in COEF_COLUMNS]
-                  for r in df[f"row_{col}"]])
-    return (X * C).sum(axis=1)
-
-
-def mape(y: np.ndarray, yhat: np.ndarray, mask) -> float:
-    mask = np.asarray(mask, dtype=bool)
-    if not mask.any():
-        return float("nan")
-    return float(np.mean(np.abs(y[mask] - yhat[mask]) / np.abs(y[mask])) * 100)
-
-
-# ---------------------------------------------------------------------------
-# Reports
-# ---------------------------------------------------------------------------
-def accuracy_report(df: pd.DataFrame, coefs: dict) -> pd.DataFrame:
-    keys = (["part", "setting"] if "part" in df else ["setting"])
-    out = []
-    for col in MEASURED:
-        kernel = SOURCE_OF[col]
-        y = df[col].to_numpy(float)
-        yhat = _predict_column(coefs, df, col)
-        priced = df.index.isin(priced_rows(df, kernel).index)
-        for vals, g in df.groupby(keys, sort=False):
-            vals = vals if isinstance(vals, tuple) else (vals,)
-            sel = df.index.isin(g.index) & priced
-            out.append({**dict(zip(keys, vals)), "site": col, "kernel": kernel,
-                        "mape": mape(y, yhat, sel), "n_fit": int(sel.sum())})
-    return pd.DataFrame(out).sort_values([*keys, "site"], kind="stable")
-
-
-def nocp_measured(base_rows: pd.DataFrame, mode: str = "train") -> float:
-    cols = [c for k, c in STEP_SITES[mode] if k not in CP_ONLY_KERNELS]
-    return float(sum(base_rows[c].iloc[0] for c in cols))
-
-
-def decision_report(df: pd.DataFrame, coefs: dict, P: int,
-                    mode: str = "train") -> pd.DataFrame:
-    total_col = MODES[mode]
-    out = []
-    for label, sub in df.groupby("setting", sort=True):
-        H = int(sub["H"].iloc[0])
-        chunk = int(sub["chunk"].iloc[0])
-        cu = [int(x) for x in str(sub["cu"].iloc[0]).split(":")]
-        cp = sub[sub["cp"]]
-        base = sub[~sub["cp"]]
-        kw = dict(cu_seqlens=cu, num_v_heads=H, coefs=coefs, P=P, debug=True,
-                  is_train=(mode == "train"),
-                  warmup_per_head=warmup_from_gate_avg(
-                      _gate_avg_of(sub["gate_avg"].iloc[0]), chunk))
-
-        rec = dict(setting=label, mode=mode)
-        if "part" in sub:
-            rec["part"] = sub["part"].iloc[0]
-        rec.update(n_cp=len(cp), n_base=len(base))
-        r = decide(**kw)
-        rec["verdict"] = "CP" if r["use_cp"] else "no-CP"
-        rec["lcp"] = r["lcp"]
-
-        if len(cp):
-            grid = sorted(int(s) for s in cp["L_cp"].unique())
-            on_grid = decide(candidates=grid, margin=0.0,
-                             **{k: v for k, v in kw.items()})
-            S = on_grid["best_cp_lcp"]
-            at_model = float(cp[cp["L_cp"] == S][total_col].iloc[0])
-            best = float(cp[total_col].min())
-            rec.update(
-                lcp_model=S,
-                lcp_meas=int(cp.loc[cp[total_col].idxmin(), "L_cp"]),
-                regret_pct=(at_model / best - 1.0) * 100)
-        else:
-            rec.update(lcp_model=None, lcp_meas=None, regret_pct=float("nan"))
-
-        if len(base):
-            t_base = nocp_measured(base, mode)
-            rec["base_err_pct"] = (r["nocp_pred_ms"] / t_base - 1.0) * 100
-            rec["verdict_meas"] = ("CP" if len(cp)
-                                   and float(cp[total_col].min()) < t_base
-                                   else "no-CP")
-        else:
-            rec["base_err_pct"] = float("nan")
-            rec["verdict_meas"] = None
-        out.append(rec)
-    return pd.DataFrame(out)
-
-
-# ---------------------------------------------------------------------------
-# Plots
-# ---------------------------------------------------------------------------
-# Panel tint per part (held-out eval shapes read differently from train).
-_PART_BG = {"train": "#ffffff", "eval": "#eef4ee"}
-
-# One colour per call site; two sources of one row get two tints of one hue.
-_SITE_COLOR = {"prepare_h": "#4C78A8", "prepare_h_bidi": "#8AB4D8",
-               "correct_h0": "#F58518", "correct_dht": "#FBBE79",
-               "fused_fwd": "#54A24B", "fused_bwd": "#E45756",
-               "prepare_dh": "#B279A2", "recompute_h": "#9D755D"}
-
-
-def _pyplot():
-    try:
-        import matplotlib
-    except ImportError as e:
-        raise SystemExit(
-            "--plot needs matplotlib, which is not a dependency of flash_qla "
-            "(nothing on the launch path plots). Install it for calibration "
-            "only:\n    pip install matplotlib") from e
-    matplotlib.use("Agg")  # calibration runs on headless GPU boxes
-    import matplotlib.pyplot as plt
-    return matplotlib, plt
-
-
-def _parts(df: pd.DataFrame) -> pd.Series:
-    return df["part"] if "part" in df else pd.Series("train", index=df.index)
-
-
-def _totals(coefs: dict, df: pd.DataFrame, mode: str = "train"):
-    sites = STEP_SITES[mode]
-    base_sites = tuple(s for s in sites if s[0] not in CP_ONLY_KERNELS)
-    meas = lambda ss: df[[c for _, c in ss]].sum(axis=1).to_numpy(float)
-    pred = lambda ss: sum(_predict_column(coefs, df, c) for _, c in ss)
-    cp = df["cp"].to_numpy(bool)
-    return (np.where(cp, meas(sites), meas(base_sites)),
-            np.where(cp, pred(sites), pred(base_sites)))
-
-
-def _plot_curves(plt, matplotlib, df: pd.DataFrame, dec: pd.DataFrame,
-                 path: str, mode: str = "train") -> str:
-    rec = {r["setting"]: r for r in dec.to_dict("records")}
-    shapes = sorted(df["setting"].unique())
-    ncol = min(4, len(shapes))
-    nrow = -(-len(shapes) // ncol)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(4.3 * ncol, 3.5 * nrow),
-                             squeeze=False)
-    for ax, name in zip(axes.ravel(), shapes):
-        g = df[df["setting"] == name].sort_values("L_cp")
-        cp, base = g[g["cp"]], g[~g["cp"]]
-        part = str(_parts(g).iloc[0])
-        r = rec.get(name, {})
-        if len(cp):
-            ax.plot(cp["L_cp"], cp["meas_total"], "o", ms=4.5, color="#333",
-                    label="measured (CP)")
-            ax.plot(cp["L_cp"], cp["pred_total"], "-", lw=1.7, color="#E45756",
-                    label="model")
-        if len(base):
-            ax.axhline(float(base["meas_total"].iloc[0]), color="#4C78A8",
-                       lw=1.3, label="measured no-CP")
-            ax.axhline(float(base["pred_total"].iloc[0]), color="#4C78A8",
-                       lw=1.1, ls="--", label="model no-CP")
-        for key, color in (("lcp_meas", "#333"), ("lcp_model", "#E45756")):
-            if r.get(key):
-                ax.axvline(int(r[key]), color=color, ls=":", lw=1.1)
-        regret = r.get("regret_pct")
-        sub = (f"L* meas {r.get('lcp_meas', '-')} / model "
-               f"{r.get('lcp_model', '-')}"
-               + (f", regret {regret:.2f}%" if regret == regret else "")
-               + f"\nverdict {r.get('verdict', '?')}"
-               + (f" (measured {r['verdict_meas']})" if r.get("verdict_meas")
-                  else ""))
-        ax.set(xscale="log", xlabel="L_cp (chunks)", ylabel="latency (ms)",
-               title=f"{name}  [{part}]\n{sub}")
-        ax.title.set_fontsize(9)
-        # tick the shape's own grid as plain chunk counts, thinned to <=6 labels
-        grid = sorted(int(x) for x in g["L_cp"].unique())
-        ax.set_xticks(grid[::-(-len(grid) // 6)])
-        ax.xaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
-        ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
-        ax.set_facecolor(_PART_BG.get(part, "#ffffff"))
-        ax.grid(alpha=.25, which="both")
-        if ax is axes.ravel()[0]:
-            ax.legend(fontsize=7)
-    for ax in axes.ravel()[len(shapes):]:
-        ax.axis("off")
-    fig.suptitle(f"autocp [{mode}]: fitted latency vs L_cp per shape "
-                 f"(green panels = held-out eval shapes)")
-    fig.tight_layout()
-    fig.savefig(path, dpi=130)
-    plt.close(fig)
-    return path
-
-
-def _plot_parity(plt, matplotlib, df: pd.DataFrame, coefs: dict,
-                 path: str) -> str:
-    ncol = min(3, len(MEASURED))
-    nrow = -(-len(MEASURED) // ncol)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(4.75 * ncol, 4.5 * nrow),
-                            squeeze=False)
-    parts = _parts(df).to_numpy()
-    for ax, k in zip(axes.ravel(), MEASURED):
-        kernel = SOURCE_OF[k]
-        priced = df.index.isin(priced_rows(df, kernel).index)
-        y = df[k].to_numpy(float)
-        yhat = _predict_column(coefs, df, k)
-        tags = []
-        # eval drawn hollow and on top so it isn't buried under the train points
-        for part, style in (
-                ("train", dict(marker="o", s=24, alpha=.7,
-                               c=_SITE_COLOR[k])),
-                ("eval", dict(marker="*", s=75, facecolors="none",
-                              edgecolors="k", linewidths=.8, zorder=5))):
-            m = priced & (parts == part)
-            if not m.any():
-                continue
-            ax.scatter(y[m], yhat[m], label=f"{part} (n={int(m.sum())})", **style)
-            tags.append(f"{part} {mape(y, yhat, m):.1f}%")
-        lo, hi = y[priced].min() * .7, y[priced].max() * 1.3
-        ax.plot([lo, hi], [lo, hi], "k-", lw=.8)
-        for f in (1.1, 1 / 1.1):
-            ax.plot([lo, hi], [lo * f, hi * f], "k--", lw=.6, alpha=.45)
-        ax.set(xscale="log", yscale="log", xlim=(lo, hi), ylim=(lo, hi),
-               xlabel="measured (ms)", ylabel="predicted (ms)",
-               title=f"{k}   [{', '.join(sorted(df.loc[priced, f'row_{k}'].unique()))}]"
-                     f"\nMAPE  {'   '.join(tags)}")
-        ax.title.set_fontsize(10)
-        for axis in (ax.xaxis, ax.yaxis):  # log minor labels collide otherwise
-            axis.set_minor_formatter(matplotlib.ticker.NullFormatter())
-        ax.grid(alpha=.25, which="both")
-        ax.legend(loc="upper left", fontsize=8)
-    for ax in axes.ravel()[len(MEASURED):]:
-        ax.axis("off")
-    fig.suptitle("autocp latency model: per-call-site parity, fitted on train only "
-                 "(dashed = +/-10%; sources sharing a row share a hue)")
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
-    return path
-
-
-def plot_fit(df: pd.DataFrame, coefs: dict, decs: dict,
-             outdir: str) -> list[str]:
-    matplotlib, plt = _pyplot()
-    os.makedirs(outdir, exist_ok=True)
-    paths = []
-    for mode, dec in decs.items():
-        d = df.copy()
-        d["meas_total"], d["pred_total"] = _totals(coefs, d, mode)
-        paths.append(_plot_curves(plt, matplotlib, d, dec,
-                                  os.path.join(outdir, f"curves_{mode}.png"),
-                                  mode))
-    paths.append(_plot_parity(plt, matplotlib, df, coefs,
-                              os.path.join(outdir, "parity.png")))
-    return paths
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def _resolve_env(args, cache: dict):
+@dataclass
+class Artifacts:
+    coefs: dict
+    counts: dict
+    acc: pd.DataFrame
+    decs: dict
+    allrows: pd.DataFrame
+
+
+def _resolve_env(args) -> tuple[str, int]:
+    """device / P for the cache key and the model: --device / --sm-count when
+    given, else this GPU's -- which is also what flash_qla was compiled for."""
     device, P = args.device, args.sm_count
     if device is None or P is None:
-        if args.from_cache:
-            devs = {r["device"] for r in cache.values()}
-            Ps = {int(r["P"]) for r in cache.values()}
-            if device is None:
-                if len(devs) != 1:
-                    raise SystemExit(
-                        f"--from-cache needs --device: cache holds {sorted(devs)}")
-                device = devs.pop()
-            if P is None:
-                if len(Ps) != 1:
-                    raise SystemExit(
-                        f"--from-cache needs --sm-count: cache holds {sorted(Ps)}")
-                P = Ps.pop()
-        else:
-            import torch  # only the measuring path may need torch
-            if device is None:
-                device = torch.cuda.get_device_name()
-            if P is None:
-                P = torch.cuda.get_device_properties().multi_processor_count
+        import torch
+        if device is None:
+            device = torch.cuda.get_device_name()
+        if P is None:
+            P = torch.cuda.get_device_properties().multi_processor_count
     return device, int(P)
 
 
-def main() -> None:
+def _resolve_arch(args) -> str:
+    """--arch when given, else this GPU's via the same probe flash_qla runs on
+    import (so it is already cached here).
+
+    Only the omitted case asks the device, which keeps --arch a pure override.
+    A box with no visible GPU dies earlier than this -- importing flash_qla
+    already queries it -- so the guard mainly keeps the message legible.
+    """
+    if args.arch:
+        return args.arch
+    try:
+        arch = current_arch()
+    except Exception as exc:  # no GPU, or a compute version we don't support
+        raise SystemExit(
+            f"could not detect the architecture: {exc}\n"
+            f"pass --arch explicitly ({'|'.join(sorted(BACKEND_OF))}), or "
+            f"ARCH=<arch> when running through scripts/fit_autocp.sh") from exc
+    print(f"arch: detected {arch} on this device")
+    return arch
+
+
+def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="fit the autocp latency model from shape CSVs "
                     "(measuring the kernels as needed)")
     ap.add_argument("--train", required=True, help="training shape CSV")
-    ap.add_argument("--arch", required=True, choices=sorted(BACKEND_OF),
+    ap.add_argument("--arch", default=None, choices=sorted(BACKEND_OF),
                     help="architecture these coefficients are for; picks the "
-                         "backend whose block_DV rules route the fitted rows")
+                         "backend whose block_DV rules route the fitted rows "
+                         "(default: this GPU's)")
     ap.add_argument("--eval", dest="eval_path", default=None,
                     help="held-out shape CSV (accuracy + decision quality only)")
-    ap.add_argument("--out", default=None, help="output coefficient CSV")
+    ap.add_argument("--out", default=None,
+                    help="output coefficient CSV (default "
+                         "tmp/coefs_<arch>.csv, never the in-package one)")
     ap.add_argument("--cache", default=None,
                     help="measurement cache CSV "
-                         "(default debug/autocp_cache_<device>.csv)")
+                         "(default tmp/autocp_cache_<device>.csv)")
     ap.add_argument("--sm-count", type=int, default=None,
                     help="P; defaults to this device's SM count")
     ap.add_argument("--device", default=None,
@@ -507,27 +240,28 @@ def main() -> None:
     ap.add_argument("--swa-ratio", type=float, default=0.0)
     ap.add_argument("--warmup-ms", type=float, default=25)
     ap.add_argument("--rep-ms", type=float, default=100)
-    ap.add_argument("--measure-only", action="store_true",
-                    help="fill the cache and stop")
-    ap.add_argument("--from-cache", action="store_true",
-                    help="fit from the cache only; error on a missing row "
-                         "(never imports torch)")
+    ap.add_argument("--refresh-cache", action="store_true",
+                    help="re-measure every case instead of reusing cache hits "
+                         "(the re-timed rows replace their stale ones)")
     ap.add_argument("--report-csv", default=None,
                     help="also write the accuracy / decision tables here "
                          "(<stem>_accuracy.csv, <stem>_decision.csv)")
     ap.add_argument("--plot", default=None, metavar="DIR",
                     help="write curves_<mode>.png / parity.png here (needs "
                          "matplotlib, which is not a flash_qla dependency)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.lcp_ratio is None:
-        from .utils import DEFAULT_LCP_RATIO
         args.lcp_ratio = DEFAULT_LCP_RATIO
-    if not args.measure_only and not args.out:
-        raise SystemExit("--out is required unless --measure-only is given")
+    args.arch = _resolve_arch(args)
+    if not args.out:
+        args.out = default_coefs_path(args.arch)
     if args.plot:
-        _pyplot()  # fail on a missing matplotlib now, not after measuring
+        ensure_matplotlib()  # fail on a missing matplotlib now, not after measuring
+    return args
 
+
+def run(args) -> Artifacts:
     kw = dict(Hk=args.Hk, dtype=args.dtype, swa_ratio=args.swa_ratio)
     groups = [("train", load_specs(args.train, **kw))]
     if args.eval_path:
@@ -538,28 +272,15 @@ def main() -> None:
         raise SystemExit(f"shape names appear in both --train and --eval: "
                          f"{sorted(clash)}")
 
-    cache_path = args.cache
-    if cache_path is None and args.device:
-        cache_path = default_cache_path(args.device)
-    cache = read_cache(cache_path) if cache_path else {}
-    device, P = _resolve_env(args, cache)
-    if cache_path is None:
-        cache_path = default_cache_path(device)
-        cache = read_cache(cache_path)
+    device, P = _resolve_env(args)
+    cache_path = args.cache or default_cache_path(device)
 
     backend = BACKEND_OF[args.arch]
     specs = [s for _, g in groups for s in g]
-    if args.from_cache:
-        print(f"cache: {cache_path} ({len(cache)} rows, measuring disabled)")
-    else:
-        from .measure import measure_specs
-        cache = measure_specs(specs, cache_path=cache_path, P=P,
-                              chunk=args.chunk, ratio=args.lcp_ratio,
-                              device=device, warmup_ms=args.warmup_ms,
-                              rep_ms=args.rep_ms)
-        if args.measure_only:
-            print(f"\nmeasure-only: cache is at {cache_path}")
-            return
+    cache = measure_specs(specs, cache_path=cache_path, P=P,
+                          chunk=args.chunk, ratio=args.lcp_ratio,
+                          device=device, warmup_ms=args.warmup_ms,
+                          rep_ms=args.rep_ms, refresh=args.refresh_cache)
 
     frames = []
     for part, g in groups:
@@ -603,23 +324,53 @@ def main() -> None:
             print(f"!! {len(bad)} setting(s) where the {mode} verdict disagrees "
                   f"with the measurement: {sorted(bad['setting'])}")
 
+    return Artifacts(coefs=coefs, counts=counts, acc=acc, decs=decs,
+                     allrows=allrows)
+
+
+def _mkdirs_for(path: str) -> None:
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def _print_ship_hint(path: str, arch: str) -> None:
+    """Reminder that a fit is not installed. Kernel times drift between sessions,
+    so overwriting the shipped CSV stays a deliberate `cp`."""
+    shipped = shipped_coefs_path(arch)
+    if os.path.realpath(path) == os.path.realpath(shipped):
+        return
+    # absolute, so the two lines survive being pasted into a shell elsewhere
+    path = os.path.abspath(path)
+    print("\nnot installed. compare, then ship:")
+    print(f"  diff {path} {shipped}")
+    print(f"  cp   {path} {shipped}")
+
+
+def emit(args, art: Artifacts) -> None:
     if args.out:
-        d = os.path.dirname(os.path.abspath(args.out))
-        if d:
-            os.makedirs(d, exist_ok=True)
-        save_coefs(args.out, coefs)
+        _mkdirs_for(args.out)
+        save_coefs(args.out, art.coefs)
         print(f"\ncoefficients written: {args.out}")
     if args.report_csv:
+        _mkdirs_for(args.report_csv)
         stem = os.path.splitext(args.report_csv)[0]
-        acc.to_csv(f"{stem}_accuracy.csv", index=False)
+        art.acc.to_csv(f"{stem}_accuracy.csv", index=False)
         # both modes in one file, distinguished by the mode column
-        pd.concat(decs.values(), ignore_index=True).to_csv(
+        pd.concat(art.decs.values(), ignore_index=True).to_csv(
             f"{stem}_decision.csv", index=False)
         print(f"reports written: {stem}_accuracy.csv, {stem}_decision.csv")
     # last, so a plotting failure can't cost a coefficient run its GPU time
     if args.plot:
-        for p in plot_fit(allrows, coefs, decs, args.plot):
+        for p in plot_fit(art.allrows, art.coefs, art.decs, args.plot):
             print(f"figure written: {p}")
+    if args.out:  # the ship reminder reads best as the final line
+        _print_ship_hint(args.out, args.arch)
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    emit(args, run(args))
 
 
 if __name__ == "__main__":

@@ -29,8 +29,8 @@ from flash_qla.ops.gated_delta_rule.chunk.cp.context import (
     _build_intra_cp_context,
 )
 from .utils import (
-    MEASURED, ShapeSpec, lcp_grid, append_cache, cache_key, cache_row_complete,
-    read_cache,
+    MEASURED, ShapeSpec, case_key, lcp_grid, append_cache, cache_key,
+    cache_row_complete, read_cache, rewrite_cache,
 )
 
 K_DIM = V_DIM = 128
@@ -213,16 +213,13 @@ def measure_shape(spec: ShapeSpec, lcps, *, P: int, chunk: int = CHUNK_SIZE,
 
 
 def plan_cases(specs, *, P: int, chunk: int, ratio: float, device: str,
-               cache: dict) -> tuple[list[tuple], int]:
+               cache: dict, refresh: bool = False) -> tuple[list[tuple], int]:
     todo, hits = [], 0
     for spec in specs:
         want = []
         for lcp in lcp_grid(spec.cmax(chunk), ratio):
-            key = cache_key(dict(device=device, P=P, chunk=chunk,
-                                 dtype=spec.dtype, swa_ratio=spec.swa_ratio,
-                                 H=spec.H, Hk=spec.Hk, cu=spec.cu_str,
-                                 L_cp=lcp))
-            row = cache.get(key)
+            key = case_key(spec, lcp, P=P, chunk=chunk, device=device)
+            row = None if refresh else cache.get(key)
             if row is not None and cache_row_complete(row):
                 hits += 1
             else:
@@ -236,7 +233,7 @@ def plan_cases(specs, *, P: int, chunk: int, ratio: float, device: str,
 def measure_specs(specs, *, cache_path: str, P: int, chunk: int = CHUNK_SIZE,
                   ratio: float | None = None, device: str | None = None,
                   warmup_ms: float = 25, rep_ms: float = 100, seed: int = 42,
-                  verbose: bool = True) -> dict[tuple, dict]:
+                  refresh: bool = False, verbose: bool = True) -> dict[tuple, dict]:
     from .utils import DEFAULT_LCP_RATIO
     if ratio is None:
         ratio = DEFAULT_LCP_RATIO
@@ -244,10 +241,18 @@ def measure_specs(specs, *, cache_path: str, P: int, chunk: int = CHUNK_SIZE,
         device = torch.cuda.get_device_name()
     cache = read_cache(cache_path)
     todo, hits = plan_cases(specs, P=P, chunk=chunk, ratio=ratio,
-                            device=device, cache=cache)
+                            device=device, cache=cache, refresh=refresh)
     n_todo = sum(len(l) for _, l in todo)
+    n_dropped = 0
+    if refresh and todo:
+        redo = {case_key(spec, lcp, P=P, chunk=chunk, device=device)
+                for spec, lcps in todo for lcp in lcps}
+        n_dropped = len(redo & cache.keys())
+        cache = {k: r for k, r in cache.items() if k not in redo}
+        rewrite_cache(cache_path, cache.values())
     if verbose:
-        print(f"cache: {cache_path} ({hits} hit, {n_todo} to measure)")
+        note = f", {n_dropped} existing row(s) dropped" if n_dropped else ""
+        print(f"cache: {cache_path} ({hits} hit, {n_todo} to measure{note})")
     done = 0
     for spec, lcps in todo:
         for row in measure_shape(spec, lcps, P=P, chunk=chunk, device=device,

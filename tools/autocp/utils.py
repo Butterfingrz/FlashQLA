@@ -7,10 +7,16 @@ import csv
 import os
 from dataclasses import dataclass
 
+import numpy as np
+import pandas as pd
+
 from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.launch import coef_rows
 from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.utils import (
+    COEFS_DIR,
     COEF_COLUMNS,
+    CP_ONLY_KERNELS,
     KERNELS,
+    KERNEL_SOURCES,
     MIN_LCP,
     seq_chunks,
 )
@@ -145,6 +151,12 @@ def load_specs(path: str, *, Hk: int | None = None, dtype: str = "bfloat16",
     return specs
 
 
+def parse_gate_avg(s) -> list[float]:
+    """Parse a cache row's ``gate_avg`` field (``measure.py`` writes it as a
+    ``:``-joined string, one decay average per value head)."""
+    return [float(x) for x in str(s).split(":") if x != ""]
+
+
 # ---------------------------------------------------------------------------
 # Measurement cache: what sits between measuring and fitting
 # ---------------------------------------------------------------------------
@@ -175,6 +187,14 @@ def cache_key(row: dict) -> tuple:
     return tuple(out)
 
 
+def case_key(spec, lcp: int, *, P: int, chunk: int, device: str) -> tuple:
+    """The cache key of one (shape, L_cp) case. Both the measurement planner and
+    the fitter ask for rows this way, so they have to agree on it."""
+    return cache_key(dict(device=device, P=P, chunk=chunk, dtype=spec.dtype,
+                          swa_ratio=spec.swa_ratio, H=spec.H, Hk=spec.Hk,
+                          cu=spec.cu_str, L_cp=lcp))
+
+
 def read_cache(path: str) -> dict[tuple, dict]:
     if not path or not os.path.exists(path):
         return {}
@@ -201,6 +221,21 @@ def read_cache(path: str) -> dict[tuple, dict]:
 
 def cache_row_complete(row: dict) -> bool:
     return all(isinstance(row.get(c), float) for c in MEASURED)
+
+
+def rewrite_cache(path: str, rows) -> None:
+    rows = list(rows)
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(CACHE_COLUMNS),
+                           extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+    os.replace(tmp, path)
 
 
 def _cache_header(path: str) -> list[str] | None:
@@ -241,6 +276,76 @@ def device_slug(name: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in name.strip().lower()
                    ).strip("_") or "unknown"
 
+DEBUG_DIR = "tmp"
 
-def default_cache_path(device: str, root: str = "debug") -> str:
+
+def default_cache_path(device: str, root: str = DEBUG_DIR) -> str:
     return os.path.join(root, f"autocp_cache_{device_slug(device)}.csv")
+
+
+def default_coefs_path(arch: str, root: str = DEBUG_DIR) -> str:
+    return os.path.join(root, f"coefs_{arch}.csv")
+
+
+def shipped_coefs_path(arch: str) -> str:
+    return os.path.join(COEFS_DIR, f"{arch}.csv")
+
+def depth_col(col: str) -> str:
+    """Column holding the schedule depth of measured column ``col``."""
+    return f"d_{col}"
+
+
+def row_col(col: str) -> str:
+    """Column holding the coefficient row ``col``'s launch routes to."""
+    return f"row_{col}"
+
+MODES = {"infer": "fwd_total", "train": "all_total"}
+
+SOURCE_OF = {col: kernel for kernel, modes in KERNEL_SOURCES.items()
+             for col in modes.values()}
+MODE_OF = {col: mode == "train" for modes in KERNEL_SOURCES.values()
+           for mode, col in modes.items()}
+STEP_SITES = {mode: tuple((kernel, modes[mode])
+                          for kernel, modes in KERNEL_SOURCES.items()
+                          if mode in modes)
+              for mode in MODES}
+
+FEATURE_COLUMNS = ("u", *(depth_col(col) for col in MEASURED))
+
+
+def check_taxonomy() -> None:
+    if set(SOURCE_OF) != set(MEASURED):
+        raise AssertionError(
+            f"every measured column must belong to exactly one kernel; "
+            f"unclaimed {sorted(set(MEASURED) - set(SOURCE_OF))}")
+    stray = {m for modes in KERNEL_SOURCES.values() for m in modes} - set(MODES)
+    if stray:
+        raise AssertionError(f"KERNEL_SOURCES names modes {sorted(stray)} that "
+                             f"MODES does not: {sorted(MODES)}")
+
+
+check_taxonomy()
+
+
+def priced_rows(df: pd.DataFrame, kernel: str) -> pd.DataFrame:
+    return df[df["cp"]] if kernel in CP_ONLY_KERNELS else df
+
+
+def design(df: pd.DataFrame, col: str):
+    X = np.stack([df[depth_col(col)].to_numpy(float), df["u"].to_numpy(float),
+                  np.ones(len(df))], axis=1)
+    return X, df[col].to_numpy(float)
+
+
+def predict_column(coefs: dict, df: pd.DataFrame, col: str) -> np.ndarray:
+    X, _ = design(df, col)
+    C = np.array([[coefs["kernels"][r][c] for c in COEF_COLUMNS]
+                  for r in df[row_col(col)]])
+    return (X * C).sum(axis=1)
+
+
+def mape(y: np.ndarray, yhat: np.ndarray, mask) -> float:
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return float("nan")
+    return float(np.mean(np.abs(y[mask] - yhat[mask]) / np.abs(y[mask])) * 100)
