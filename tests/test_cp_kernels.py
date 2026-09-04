@@ -514,6 +514,7 @@ def test_aggregate_card_state(segments, state_v_first, fallback_pattern, reverse
         seq_map, n_cp, H, state_v_first=state_v_first,
         fallback_pattern=fallback_pattern, seed=SEED + 2,
     )
+    ht, mt = ht.bfloat16(), mt.bfloat16()
 
     h_card, m_card = aggregate_card_state(
         ht, mt, fallback, seq_map, state_v_first=state_v_first,

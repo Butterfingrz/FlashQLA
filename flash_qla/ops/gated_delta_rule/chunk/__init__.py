@@ -8,14 +8,13 @@ from flash_qla.utils import l2norm_fwd, l2norm_bwd, prepare_chunk_offsets
 from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
 
 # `aggregate_card_state` is only needed by combined inter+intra CP. It relies on the
-# `store_inter_h` / `compute_m` modes of `tilelang_correct_h0`, which so far exist only
-# in the SM100/SM103 kernels; where it is `None`, pure inter and pure intra still work
-# and `cp_preprocess_fwd/bwd` reject inter+intra with an explicit error.
+# `store_inter_h` / `compute_m` modes of `tilelang_correct_h0`, which exist in the
+# SM90/SM100/SM103 kernels; where it is `None` (e.g. SM120), pure inter and pure intra
+# still work and `cp_preprocess_fwd/bwd` reject inter+intra with an explicit error.
 if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
     from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
-    from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
+    from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
     from .hopper.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
-    aggregate_card_state = None
     CHUNK_SIZE = 64
 elif tilelang.contrib.nvcc.get_target_compute_version() in ["10.0", "10.3"]:
     from .blackwell import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve

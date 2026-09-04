@@ -27,8 +27,7 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.8",
-        "tilelang==0.1.9",
-        "apache-tvm-ffi==0.1.9",
+        "tilelang==0.1.12",
     ],
     zip_safe=False,
 )

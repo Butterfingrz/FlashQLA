@@ -103,10 +103,10 @@ FWD_SEQLEN_CONFIGS = [
     SeqLenConfig("1024x8", [1024] * 8),
 ]
 BWD_MODEL_CONFIGS = [
-    ModelConfig("hk16_hv32", h_qk=16, h_v=32),
-    ModelConfig("hk8_hv16", h_qk=8, h_v=16),
-    ModelConfig("hk4_hv8",  h_qk=4, h_v=8),
-    ModelConfig("hk2_hv4",  h_qk=2, h_v=4),
+    ModelConfig("hk32_hv32", h_qk=32, h_v=32),
+    ModelConfig("hk16_hv16", h_qk=16, h_v=16),
+    ModelConfig("hk8_hv8",   h_qk=8,  h_v=8),
+    ModelConfig("hk4_hv4",   h_qk=4,  h_v=4),
 ]
 
 BWD_SEQLEN_CONFIGS = [

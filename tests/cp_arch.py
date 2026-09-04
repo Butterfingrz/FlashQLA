@@ -47,7 +47,7 @@ def detect_arch() -> str | None:
 ARCH = detect_arch()
 
 ARCH_CAPS: dict[str, dict] = {
-    "SM90": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra=False),
+    "SM90": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra=True),
     "SM100": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra=True),
     "SM103": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra=True),
     "SM120": dict(chunk_size=32, bwd=False, intra=True, inter=True, inter_intra=False),

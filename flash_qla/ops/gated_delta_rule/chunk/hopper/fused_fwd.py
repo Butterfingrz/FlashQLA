@@ -728,7 +728,12 @@ def fused_gdr_fwd(
     o = torch.empty_like(v)
 
     grid_size = real_batch_size * H
-    block_DV = 128
+    if grid_size >= TARGET_NUM_CTAS:
+        block_DV = 128
+    elif grid_size * 2 >= TARGET_NUM_CTAS:
+        block_DV = 64
+    else:
+        block_DV = 32
 
     tilelang_fused_chunk_gdr_fwd_kernel = tilelang_fused_chunk_gdr_fwd(
         H,
