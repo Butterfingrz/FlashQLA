@@ -42,14 +42,14 @@ WARMUP_TOL = -10.0
 
 COEFS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coefs")
 
-#: Every fitted row obeys the same law: t = tau * depth + kappa * u + c.
-COEF_COLUMNS = ("tau", "kappa", "c")
+#: Every fitted row obeys the same law: t = a * depth + b * u + c.
+COEF_COLUMNS = ("a", "b", "c")
 
 
 def predict_kernel(coefs: dict, feat: "StructFeatures", kernel: str) -> float:
     row = launch_config(coefs["backend"], kernel, feat.shape).row
     k = coefs["kernels"][row]
-    return k["tau"] * feat.depth[kernel] + k["kappa"] * feat.u + k["c"]
+    return k["a"] * feat.depth[kernel] + k["b"] * feat.u + k["c"]
 
 
 class AutocpInfo(UserWarning):
@@ -179,7 +179,7 @@ class StructFeatures:
     P: int
     num_raw: int          # raw sequences
     num_partitions: int   # CP partitions (== cp_batch_size)
-    u: float              # G / P, with G = H * num_partitions total CTAs
+    u: float              # G = H * num_partitions, total CTAs
     depth: dict           # kernel -> schedule depth under the launch it takes
 
     @property
@@ -258,6 +258,6 @@ def struct_features(chunks, S: int, H: int, P: int, warmup_per_head,
         S=S, H=H, P=P,
         num_raw=len(chunks),
         num_partitions=n_part,
-        u=H * n_part / P,
+        u=H * n_part,
         depth=depths,
     )

@@ -301,7 +301,7 @@ def run(args) -> Artifacts:
     print(f"fitted on train only; baseline rows held out of "
           f"{', '.join(CP_ONLY_KERNELS)}")
     for row, c in coefs["kernels"].items():
-        print(f"  {row:17s} tau={c['tau']:.7f}  kappa={c['kappa']:.7f}  "
+        print(f"  {row:17s} a={c['a']:.7f}  b={c['b']:.7f}  "
               f"c={c['c']:.6f}   n={counts[row]}")
 
     acc = accuracy_report(allrows, coefs)
