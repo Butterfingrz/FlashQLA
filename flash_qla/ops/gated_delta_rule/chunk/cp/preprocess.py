@@ -126,24 +126,12 @@ def cp_preprocess_fwd(
             num_warmup, num_warmup_bwd, fallback, fallback_bwd = get_warmup_chunks_bidi(
                 g=g, cu_seqlens=cp_cu, ht_mask_fwd=cp_context.ht_mask,
                 ht_mask_bwd=cp_context.ht_mask_bwd, chunk_size=chunk_size,
+                seq_map_r2c=seq_map_r2c, force_inter_boundaries=is_inter,
             )
         else:
             num_warmup, fallback = get_warmup_chunks(
                 g=g, cu_seqlens=cp_cu, ht_mask=cp_context.ht_mask, chunk_size=chunk_size,
             )
-        if is_inter:
-            first_end = seq_map_r2c[1]
-            last_start = seq_map_r2c[-2]
-            first_full = ((cp_cu[1:first_end+1] - cp_cu[:first_end] + chunk_size - 1) // chunk_size).unsqueeze(-1)
-            last_full = ((cp_cu[last_start+1:] - cp_cu[last_start:-1] + chunk_size - 1) // chunk_size).unsqueeze(-1)
-            fallback[:first_end] = True
-            fallback[last_start:] = True
-            num_warmup[:first_end] = first_full
-            num_warmup[last_start:] = last_full
-            fallback_bwd[:first_end] = True
-            fallback_bwd[last_start:] = True
-            num_warmup_bwd[:first_end] = first_full
-            num_warmup_bwd[last_start:] = last_full
         _, ht, mt = fused_gdr_h(
             k=k, v=v, a=a, g=g, b=beta, initial_state=None,
             output_final_state=True, output_h=False, cu_seqlens=cp_cu,
