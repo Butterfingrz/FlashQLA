@@ -282,7 +282,7 @@ def bench_fwd(
     results = {}
     cp_context = build_cp_context(
         cu_seqlens, enable_intra=auto_cp, num_v_heads=h_v,
-        chunk_size=CHUNK_SIZE, g=g, is_train=False,
+        chunk_size=CHUNK_SIZE, is_train=False,
     )
 
     def call_qla_fwd():
@@ -400,7 +400,7 @@ def bench_bwd(
 
     cp_context = build_cp_context(
         cu_seqlens, enable_intra=auto_cp, num_v_heads=h_v,
-        chunk_size=CHUNK_SIZE, g=g, is_train=True,
+        chunk_size=CHUNK_SIZE, is_train=True,
     )
     try:
         result = qla_fwd(
