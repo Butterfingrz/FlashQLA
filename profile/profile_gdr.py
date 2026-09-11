@@ -30,7 +30,8 @@ import pandas as pd
 # Path setup
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(PROJECT_ROOT, "tests"))  # for ref_gdr
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "tests"))    # for ref_gdr
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "profile"))  # for utils
 
 # ---------------------------------------------------------------------------
 # Imports
@@ -48,7 +49,8 @@ from flash_qla.ops.gated_delta_rule.chunk import (
     _auto_intra_cp_context,
     CHUNK_SIZE,
 )
-from flash_qla.utils import l2norm, pack, profile
+from flash_qla.utils import l2norm, pack
+from utils import profile
 
 
 def chunk_gated_delta_rule_fwd_qla(

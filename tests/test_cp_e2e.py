@@ -1,168 +1,213 @@
 # Copyright (c) 2026 The Qwen team, Alibaba Group.
 # Licensed under The MIT License [see LICENSE for details]
-"""L3: end-to-end CP correctness through the public API, for every mode and world size.
+"""L3: end-to-end multi-card CP correctness -- the multi-card extension of
+``test_gdr_unit.py``.
 
-One pytest test per ``(world_size, mode)``; every case in the shared matrix runs inside
-that test, so a world size pays the process-group setup cost once instead of once per
-case. Each test prints a per-case table (which path actually ran, and the worst relative
-error) and fails with that table attached, so one run tells you *which* configurations
-broke rather than just the first one.
+Each config is one global varlen sequence with an explicit ``(cu_seqlens, world_size)``;
+the total is divisible by the world size (inter-card CP requires it) and the interior
+boundaries fall at chosen offsets relative to the card edge at ``total / world_size``.
+One process per rank runs its token slice through the public autograd API under a built
+CP context, then compares against the float64 reference (:mod:`ref_gdr`, the same oracle
+``test_gdr_unit.py`` uses) restricted to what that rank owns.
 
-The oracle is always the same: one GPU, the whole global sequence, CP disabled.
+Single-card modes (``none`` / ``intra``) are *not* here: ``none`` is ``test_gdr_unit.py``
+and forced ``intra`` is ``test_cp_features.py``; this file is only about the cards talking
+to each other, so it needs >= 2 GPUs to run at all.
 
-The world size decides which modes are live, so the grid is diagonal: ``world_size=1``
-runs the single-card modes (``none`` / ``intra``) in-process, with no process group; from
-``world_size=2`` up, one process per rank is spawned and only the ``inter`` modes run --
-a single-card mode there would just repeat identical work on every rank.
+Debug one config::
 
-The mode-independent intra features (the ``auto_cp`` heuristic, the forward CP cache,
-mixed forward/backward CP) live in ``test_cp_features.py``: they exercise the direct-call
-wrappers rather than this case matrix.
-
-Debugging a single configuration::
-
-    pytest tests/test_cp_e2e.py --cp-world-sizes=2 --cp-case=offset-tpc2048-Hk8Hv8-g0.0625 -s
+    pytest tests/test_cp_e2e.py -k "single-ws2 and inter and kv" -s
 """
 import os
+import socket
 import sys
-from dataclasses import dataclass
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import cp_common as C
+from gdr_common import (
+    RTOL,  # noqa: F401  (re-exported so a debug run can print the tolerance)
+    REF_DTYPE,
+    CHUNK_SIZE,
+    make_inputs,
+    assert_relative,
+    chunk_gated_delta_rule_fwd_ref,
+    chunk_gated_delta_rule_bwd_ref,
+)
+from flash_qla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule
+from flash_qla.ops.gated_delta_rule.chunk.cp import build_cp_context
 
-MODES = [
-    pytest.param("none", id="none"),
-    pytest.param("intra", id="intra"),
-    pytest.param("inter", id="inter"),
-    pytest.param("inter_intra", id="inter_intra", marks=pytest.mark.cp_inter_intra),
+# (cu_seqlens, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht)
+# Interior boundaries are placed relative to the card edge at total/world_size.
+CONFIGS = [
+    pytest.param([0, 4096], 2, 8, 8, 1 / 16, False, False, id="single-ws2"),
+    pytest.param([0, 6144], 3, 8, 8, 1 / 16, False, False, id="single-ws3"),
+    pytest.param([0, 8192], 4, 8, 8, 1 / 16, False, False, id="single-ws4"),
+    pytest.param([0, 2048, 4096, 6144], 3, 8, 8, 1 / 16, True, True, id="per-card-ws3"),
+    pytest.param([0, 1024, 4096], 2, 8, 8, 1 / 16, False, False, id="offset-ws2"),
+    pytest.param([0, 1024, 1536, 4096], 2, 8, 8, 1 / 16, True, True, id="three-ws2"),
+    pytest.param([0, 3072, 4096], 2, 8, 8, 1 / 16, False, False, id="tail-ws2"),
+    pytest.param([0, 1031, 4096], 2, 8, 8, 1.0, False, False, id="offset-ragged-ws2"),
+    pytest.param([0, 4096], 2, 8, 16, 1 / 16, False, False, id="gva-ws2"),
+    pytest.param([0, 519, 4096], 2, 4, 4, 1.0, True, True, id="allflags-ws2"),
 ]
 
+# Both modes are inter-card; inter_intra additionally splits each card's local sequence
+# for intra-card CP (needs the combined-CP capability, gated in conftest). The bool is
+# `enable_intra`, threaded straight into the context builder.
+MODES = [
+    pytest.param(False, id="inter"),
+    pytest.param(True, id="inter_intra", marks=pytest.mark.cp_inter_intra),
+]
 
-def _select_cases(mode_name: str, world_size: int, case_id: str | None):
-    cases = C.cases_for_mode(mode_name, world_size)
-    if case_id is None:
-        return cases
-    return [C.find_case(mode_name, world_size, case_id)]
-
-
-@dataclass
-class _Row:
-    case_id: str
-    is_inter: bool
-    is_intra: bool
-    expect_intra: bool
-    ratios: dict
+_GRAD_LEAF = {"dq": "q", "dk": "k", "dv": "v", "dg": "g", "db": "beta"}
 
 
-def _format_table(mode_name: str, world_size: int, rows: list[_Row]) -> str:
-    width = max((len(r.case_id) for r in rows), default=10)
-    lines = [f"[{mode_name} CP, world_size={world_size}] rtol={C.RTOL:g}",
-             f"  {'case'.ljust(width)}  path         worst"]
-    for r in rows:
-        name, value = C.worst(r.ratios)
-        path = f"{'inter' if r.is_inter else '-'}+{'intra' if r.is_intra else '-'}"
-        verdict = "OK  " if value <= C.RTOL else "FAIL"
-        detail = "n/a" if name is None else f"{name}={value:.2e}"
-        lines.append(f"  {r.case_id.ljust(width)}  {path:<12} {verdict} {detail}")
-    return "\n".join(lines)
-
-
-def _run_cases(mode_name, world_size, rank, group, case_id, device) -> list[_Row]:
-    """Every selected case, forward and backward, on one rank."""
-    mode = C.CP_MODES[mode_name]
-    rows: list[_Row] = []
-    for case in _select_cases(mode_name, world_size, case_id):
-        inp = C.make_inputs(case, world_size, device)
-        reference = C.run_reference(inp, need_grad=True)
-        local, ctx = C.run_mode(inp, mode_name, rank, group=group, need_grad=True)
-        ratios = C.compare(inp, local, reference, rank,
-                           num_local_seqs=ctx.num_seqs, is_inter=ctx.is_inter)
-        if group is not None:
-            # Every rank must reach the same verdict, so the ratios are MAX-reduced.
-            ratios = C.all_reduce_ratios(ratios, device)
-        rows.append(_Row(
-            case_id=case.id,
-            is_inter=ctx.is_inter,
-            is_intra=ctx.is_intra,
-            # `force_intra_cp` bypasses the heuristic outright, so an intra-capable
-            # mode must report an active split. Without it either answer is valid --
-            # the table records which one happened.
-            expect_intra=mode.is_intra and case.force_intra_cp,
-            ratios=ratios,
-        ))
-        del inp, reference, local
-        torch.cuda.empty_cache()
-    return rows
-
-
-def _verdict(mode_name: str, world_size: int, rank: int, rows: list[_Row]):
-    """Print the table (rank 0 only) and assert on it."""
-    is_intra_mode = C.CP_MODES[mode_name].is_intra
-    table = _format_table(mode_name, world_size, rows)
-    if rank == 0:
-        print("\n" + table, flush=True)
-
-    failures = [
-        f"{r.case_id}: {C.format_ratios(r.ratios)}"
-        for r in rows if C.worst(r.ratios)[1] > C.RTOL
-    ]
-    path_errors = []
-    for r in rows:
-        if r.expect_intra and not r.is_intra:
-            path_errors.append(
-                f"{r.case_id}: force_intra_cp was set but the context reports is_intra=False")
-        if not is_intra_mode and r.is_intra:
-            path_errors.append(
-                f"{r.case_id}: mode {mode_name} unexpectedly enabled intra CP")
-    assert not failures and not path_errors, (
-        f"{mode_name} CP mismatch on rank {rank} (world_size={world_size})\n"
-        + table
-        + ("\n" + "\n".join(failures) if failures else "")
-        + ("\n" + "\n".join(path_errors) if path_errors else "")
+def _make_ctx(cu_g, num_v_heads, group, enable_intra):
+    return build_cp_context(
+        cu_g, enable_inter=True, enable_intra=enable_intra, group=group,
+        num_v_heads=num_v_heads, chunk_size=CHUNK_SIZE,
+        is_train=True, force_intra_cp=enable_intra,
     )
 
 
-def _cp_worker(rank: int, world_size: int, mode_name: str, case_id: str | None):
-    """One spawned rank: join the group, run the cases, decide pass/fail locally."""
+def _init_distributed(rank, world_size, port):
+    os.environ.update(
+        MASTER_ADDR="localhost", MASTER_PORT=port,
+        RANK=str(rank), WORLD_SIZE=str(world_size), LOCAL_RANK=str(rank),
+    )
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    return dist.group.WORLD
+
+
+def _cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _free_port() -> str:
+    s = socket.socket()
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return str(port)
+
+
+def _reference(q, k, v, g, beta, h0_ref, cu_g, scale, use_dht):
+    """Global float64 oracle: whole sequence, no CP, differentiating the same loss the
+    CP run uses (do = 1 everywhere; dht = 1 on the final state iff ``use_dht``)."""
+    q64, k64, v64 = (t.to(REF_DTYPE, copy=True) for t in (q, k, v))
+    g64, beta64 = g.to(REF_DTYPE, copy=True), beta.to(REF_DTYPE, copy=True)
+    h0_64 = h0_ref.to(REF_DTYPE, copy=True) if h0_ref is not None else None
+
+    g_r, o_r, A_r, _h, s_r = chunk_gated_delta_rule_fwd_ref(
+        q=q64, k=k64, v=v64, g=g64, beta=beta64, scale=scale,
+        initial_state=h0_64, cu_seqlens=cu_g, chunk_size=CHUNK_SIZE,
+    )
+    do = torch.ones_like(o_r)
+    dht = torch.ones_like(s_r) if use_dht else None
+    dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd_ref(
+        q64, k64, v64, g_r, beta64, A_r, scale, h0_64, do, dht, cu_g, chunk_size=CHUNK_SIZE,
+    )
+    return dict(o=o_r, s=s_r, dq=dq, dk=dk, dv=dv, db=db, dg=dg, dh0=dh0)
+
+
+def _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group):
+    cu_list, _, Hk, Hv, g_scale, use_h0, use_dht = cfg
+    T = cu_list[-1]
+
+    # One deterministic global input set, shared by every rank and the oracle.
+    (q, k, v, g, beta, _do, h0_ref, _dhtr, h0_qla, _dhtq, cu_g, scale) = make_inputs(
+        1, T, Hk, Hv, varlen=True, cu_seqlens_list=cu_list,
+        use_h0=use_h0, state_v_first=state_v_first,
+    )
+    g = g * g_scale
+    ref = _reference(q, k, v, g, beta, h0_ref, cu_g, scale, use_dht)
+
+    ctx = _make_ctx(cu_g, Hv, group, enable_intra)
+
+    part = T // world_size
+    lo, hi = rank * part, (rank + 1) * part
+    start_seq = int(torch.searchsorted(cu_g[1:], lo, side="right").item())
+    n_local = ctx.num_seqs
+
+    leaves = {
+        name: t[:, lo:hi].detach().clone().requires_grad_(True)
+        for name, t in dict(q=q, k=k, v=v, g=g, beta=beta).items()
+    }
+    h0_leaf = None
+    if h0_qla is not None:
+        h0_leaf = h0_qla[start_seq: start_seq + n_local].detach().clone().requires_grad_(True)
+
+    o, final_state = chunk_gated_delta_rule(
+        leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        scale=scale, initial_state=h0_leaf, output_final_state=True,
+        cu_seqlens=None, state_v_first=state_v_first, cp_context=ctx,
+    )
+    loss = o.float().sum()
+    if use_dht and final_state is not None:
+        loss = loss + final_state.float().sum()
+    loss.backward()
+
+    # All collectives are done; sync so a failed assert on one rank cannot hang peers.
+    dist.barrier()
+
+    tag = f"[rank{rank}/{world_size} {'inter_intra' if enable_intra else 'inter'}]"
+    assert_relative(o, ref["o"][:, lo:hi], f"{tag} o")
+    for gname, lname in _GRAD_LEAF.items():
+        assert_relative(leaves[lname].grad, ref[gname][:, lo:hi], f"{tag} {gname}")
+
+    def _fix(t):
+        return t.transpose(-1, -2) if state_v_first else t
+
+    if final_state is not None:
+        # A sequence's final state is the true global one only on the card where the
+        # sequence ends; elsewhere it is a partial (card-local) state -- skip it.
+        for si in range(n_local):
+            gs = start_seq + si
+            if lo < cu_list[gs + 1] <= hi:
+                assert_relative(_fix(final_state[si]), ref["s"][gs], f"{tag} final_state[{gs}]")
+
+    if h0_leaf is not None and h0_leaf.grad is not None:
+        # dh0 for a sequence belongs to the card where the sequence starts.
+        for si in range(n_local):
+            gs = start_seq + si
+            if lo <= cu_list[gs] < hi:
+                assert_relative(_fix(h0_leaf.grad[si]), ref["dh0"][gs], f"{tag} dh0[{gs}]")
+
+
+def _cp_worker(rank, world_size, enable_intra, cfg, state_v_first, port):
     try:
-        group = C.init_distributed(rank, world_size, C.CP_MODES[mode_name].port(world_size))
-        rows = _run_cases(mode_name, world_size, rank, group, case_id, f"cuda:{rank}")
+        group = _init_distributed(rank, world_size, port)
+        _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group)
     finally:
-        C.cleanup_distributed()
-    _verdict(mode_name, world_size, rank, rows)
+        _cleanup_distributed()
 
 
 @pytest.mark.gpu
 @pytest.mark.slow
 @pytest.mark.needs_bwd
-@pytest.mark.parametrize("mode_name", MODES)
-def test_cp_matrix(request, cp_world_size, mode_name):
-    if cp_world_size is None:
-        pytest.skip("no runnable world size (see --cp-world-sizes)")
-    reason = C.skip_reason(mode_name, cp_world_size)
-    if reason is None and cp_world_size > 1 and not C.CP_MODES[mode_name].is_inter:
-        # A single-card mode ignores the world size, so spawning W ranks would just run
-        # the same work W times. It is covered once, at world_size=1.
-        reason = f"{mode_name} CP is single-card; covered at world_size=1"
-    if reason:
-        pytest.skip(reason)
+@pytest.mark.multigpu
+@pytest.mark.parametrize(
+    "cu_list, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht", CONFIGS,
+)
+@pytest.mark.parametrize("enable_intra", MODES)
+@pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
+def test_cp(cu_list, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht,
+            enable_intra, state_v_first):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs >= {world_size} GPUs, found {torch.cuda.device_count()}")
 
-    case_id = request.config.getoption("--cp-case")
-    if cp_world_size == 1:
-        # No inter split at W=1, so no process group and no spawn: run right here.
-        rows = _run_cases(mode_name, 1, 0, None, case_id, "cuda:0")
-        _verdict(mode_name, 1, 0, rows)
-        return
-
+    cfg = (cu_list, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht)
     mp.start_processes(
         _cp_worker,
-        args=(cp_world_size, mode_name, case_id),
-        nprocs=cp_world_size,
+        args=(world_size, enable_intra, cfg, state_v_first, _free_port()),
+        nprocs=world_size,
         join=True,
         start_method="spawn",
     )

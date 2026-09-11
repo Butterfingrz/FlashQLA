@@ -51,7 +51,7 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "profile"))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "tests"))
 
 import cp_common as C
-from cuda_timer import CudaTimer
+from utils import CudaTimer
 from cp_stages import (
     FWD_STAGES, BWD_STAGES, FwdArtifacts, bwd_available,
     cp_fwd, cp_bwd, null_regions, timer_regions, nvtx_regions, nvtx_range,

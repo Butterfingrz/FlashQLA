@@ -3,8 +3,8 @@
 """Shared scaffolding for the gated-delta-rule chunk tests.
 
 Holds the direct-call wrappers, input construction and relative-error assertion
-used by both the pure-kernel correctness suite (``test_gdr_unit.py``) and the
-single-GPU intra-card CP feature tests (``test_cp_features.py``).
+used by the pure-kernel correctness suite (``test_gdr_unit.py``) and the multi-card
+CP end-to-end tests (``test_cp_e2e.py``).
 """
 import os
 import sys
@@ -81,7 +81,7 @@ def chunk_gated_delta_rule_bwd_qla(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_inputs(
+def make_inputs(
     batch_size, num_tokens, num_k_heads, num_v_heads,
     varlen, cu_seqlens_list, use_h0, state_v_first, seed=42,
 ):
@@ -186,7 +186,7 @@ def _make_inputs(
     )
 
 
-def _assert_relative(actual, expected, name, rtol=RTOL):
+def assert_relative(actual, expected, name, rtol=RTOL):
     if actual.shape[1] > expected.shape[1]:  # Padded
         assert not torch.any(torch.isnan(actual[:, expected.shape[1]:])), (
             f"{name}: got NaN in padded area"

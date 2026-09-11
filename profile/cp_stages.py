@@ -201,14 +201,17 @@ def cp_fwd(
     if is_intra:
         with region("warmup"):
             # The bidirectional variant costs one extra kernel but hands the backward
-            # its warmup plan for free, which is why production caches it.
+            # its warmup plan for free, which is why production caches it. The inter
+            # boundary forcing is folded into the kernel (force_inter_boundaries),
+            # mirroring production's cp_preprocess_fwd -- no host-side D2H/sync, so this
+            # stage now reflects what the api path actually pays (was: a Python
+            # _force_inter_boundaries_full doing per-boundary .item() reads).
             num_warmup, num_warmup_bwd, fallback, fallback_bwd = get_warmup_chunks_bidi(
                 g=g_c, cu_seqlens=cp_cu, ht_mask_fwd=ctx.ht_mask,
                 ht_mask_bwd=ctx.ht_mask_bwd, chunk_size=CHUNK_SIZE,
+                seq_map_r2c=ctx.seq_map_r2c if is_inter else None,
+                force_inter_boundaries=is_inter,
             )
-            if is_inter:
-                _force_inter_boundaries_full(ctx, num_warmup, fallback)
-                _force_inter_boundaries_full(ctx, num_warmup_bwd, fallback_bwd)
         with region("prepare_h"):
             _, ht, mt = fused_gdr_h(
                 k=k, v=v, a=a, g=g_c, b=beta, initial_state=None,
