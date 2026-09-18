@@ -124,9 +124,11 @@ def tilelang_get_warmup_chunks_bidi(
     g_dtype,
     mask_dtype,
     seqlen_dtype,
+    force_inter_boundaries: bool = False,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
+    raw_batch_size = T.dynamic("raw_batch_size")
     num_threads = tilelang.cdiv(num_heads, 32) * 32
 
     @T.prim_func
@@ -135,6 +137,7 @@ def tilelang_get_warmup_chunks_bidi(
         ht_mask_fwd: T.Tensor([batch_size], dtype=mask_dtype),
         ht_mask_bwd: T.Tensor([batch_size], dtype=mask_dtype),
         cu_seqlens: T.Tensor([batch_size + 1], dtype=seqlen_dtype),
+        seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
         num_warmup_h: T.Tensor([batch_size, num_heads], dtype=seqlen_dtype),
         num_warmup_bwd_out: T.Tensor([batch_size, num_heads], dtype=seqlen_dtype),
         fallback_fwd: T.Tensor([batch_size, num_heads], dtype=mask_dtype),
@@ -206,6 +209,18 @@ def tilelang_get_warmup_chunks_bidi(
                         n_bwd[i_h] = i_s + 1
                         f_bwd[i_h] = False
 
+            if force_inter_boundaries:
+                first_end = T.alloc_var("int32")
+                last_start = T.alloc_var("int32")
+                first_end = seq_map_r2c[1]
+                last_start = seq_map_r2c[raw_batch_size - 1]
+                if bb < first_end or bb >= last_start:
+                    for i_h in T.Parallel(num_heads):
+                        n_fwd[i_h] = num_iters
+                        n_bwd[i_h] = num_iters
+                        f_fwd[i_h] = True
+                        f_bwd[i_h] = True
+
             for i_h in T.Parallel(num_heads):
                 if n_fwd[i_h] > n_bwd[i_h]:
                     num_warmup_h[bb, i_h] = n_fwd[i_h]
@@ -228,12 +243,17 @@ def get_warmup_chunks_bidi(
     ht_mask_bwd: torch.Tensor,
     chunk_size: int = 32,
     threshold: float = -10.0,
+    seq_map_r2c: torch.Tensor = None,
+    force_inter_boundaries: bool = False,
 ):
     batch_size, num_tokens, num_heads = g.shape
     real_batch_size = ht_mask_fwd.shape[0]
     assert cu_seqlens.shape[0] == real_batch_size + 1
     assert batch_size == 1
     assert chunk_size == 32
+    if force_inter_boundaries:
+        assert seq_map_r2c is not None, "force_inter_boundaries requires seq_map_r2c"
+    seq_map = seq_map_r2c if seq_map_r2c is not None else cu_seqlens.new_zeros(2)
 
     tilelang_kernel = tilelang_get_warmup_chunks_bidi(
         num_heads=num_heads,
@@ -243,6 +263,7 @@ def get_warmup_chunks_bidi(
         g_dtype=g.dtype,
         mask_dtype=ht_mask_fwd.dtype,
         seqlen_dtype=cu_seqlens.dtype,
+        force_inter_boundaries=force_inter_boundaries,
     )
     num_warmup_h = torch.empty(
         [real_batch_size, num_heads], dtype=cu_seqlens.dtype, device=cu_seqlens.device
@@ -257,7 +278,7 @@ def get_warmup_chunks_bidi(
         [real_batch_size, num_heads], dtype=ht_mask_fwd.dtype, device=cu_seqlens.device
     )
     tilelang_kernel(
-        g, ht_mask_fwd, ht_mask_bwd, cu_seqlens,
+        g, ht_mask_fwd, ht_mask_bwd, cu_seqlens, seq_map,
         num_warmup_h, num_warmup_bwd, fallback_fwd, fallback_bwd,
     )
 
@@ -271,7 +292,8 @@ def tilelang_correct_h0(
     DV,
     res_dtype,
     accum_dtype,
-    buffer_dtype,
+    h_buffer_dtype,
+    m_buffer_dtype,
     seqlen_dtype,
     mask_dtype,
     use_raw_h0,
@@ -310,13 +332,16 @@ def tilelang_correct_h0(
     ):
         h_shared = T.alloc_shared(
             (block_DV, DK) if state_v_first else (DK, block_DV),
-            dtype=buffer_dtype,
+            dtype=h_buffer_dtype,
         )
+        # `hd_shared` and `m_shared` are the two operands of the M gemm, so both
+        # take *M*'s dtype, not h's: the backward feeds an fp32 `dht_buffer`
+        # alongside a bf16 `mt_buffer`, and `T.gemm` needs its operands to agree.
         hd_shared = T.alloc_shared(
             (block_DV, DK) if state_v_first else (DK, block_DV),
-            dtype=buffer_dtype,
+            dtype=m_buffer_dtype,
         )
-        m_shared = T.alloc_shared((DK, DK), dtype=buffer_dtype)
+        m_shared = T.alloc_shared((DK, DK), dtype=m_buffer_dtype)
 
         DV_start = bv * block_DV
         DV_end = (bv + 1) * block_DV
@@ -377,8 +402,8 @@ def tilelang_correct_h0(
         @T.prim_func
         def tilelang_correct_h0_kernel(
             raw_h0: T.Tensor(raw_state_shape, dtype=res_dtype),
-            ht_buffer: T.Tensor(state_shape, dtype=buffer_dtype),
-            mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=buffer_dtype),
+            ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
+            mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
             fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
             seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
             cp_h0: T.Tensor(state_shape, dtype=res_dtype),
@@ -433,8 +458,8 @@ def tilelang_correct_h0(
 
         @T.prim_func
         def tilelang_correct_h0_kernel(
-            ht_buffer: T.Tensor(state_shape, dtype=buffer_dtype),
-            mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=buffer_dtype),
+            ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
+            mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
             fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
             seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
             cp_h0: T.Tensor(state_shape, dtype=res_dtype),
@@ -509,7 +534,8 @@ def correct_initial_states(
         DV=v_head_dim,
         res_dtype=res_dtype,
         accum_dtype="float32",
-        buffer_dtype=ht_buffer.dtype,
+        h_buffer_dtype=ht_buffer.dtype,
+        m_buffer_dtype=mt_buffer.dtype,
         seqlen_dtype=seq_map_r2c.dtype,
         mask_dtype=fallback_mask.dtype,
         use_raw_h0=use_raw_h0,
@@ -573,7 +599,8 @@ def correct_terminal_states(
         DV=v_head_dim,
         res_dtype=res_dtype,
         accum_dtype="float32",
-        buffer_dtype=dht_buffer.dtype,
+        h_buffer_dtype=dht_buffer.dtype,
+        m_buffer_dtype=mt_buffer.dtype,
         seqlen_dtype=seq_map_r2c.dtype,
         mask_dtype=fallback_mask.dtype,
         use_raw_h0=use_raw_h0,

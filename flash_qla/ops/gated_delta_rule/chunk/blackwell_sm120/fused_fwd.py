@@ -731,7 +731,7 @@ def fused_gdr_fwd(
     o = torch.empty_like(v)
 
 
-    block_DV = 64
+    block_DV = 128
     
     tilelang_fused_chunk_gdr_fwd_kernel = tilelang_fused_chunk_gdr_fwd(
         H,

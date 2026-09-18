@@ -738,6 +738,8 @@ def tilelang_fused_chunk_gdr_bwd(
                             dq_fragment[j_s, j_k * 2 + j_k_vec] *= scale
                     T.copy(dq_fragment, dq_tmem)
                     # dg += sum(Q * dQ)
+                    # dQ is persisted in TMEM before this destructive dot.
+                    # Shared Q remains available for the stage-12/14 GEMMs.
                     for j_s, j_k in T.Parallel(block_S, DK):
                         dq_fragment[j_s, j_k] *= tmp_shared_2_1[j_s, j_k]
                     T.reduce_sum(dq_fragment, dg_fragment_2, dim=1, clear=True)

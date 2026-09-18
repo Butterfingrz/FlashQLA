@@ -21,13 +21,13 @@ setup(
     description="FlashQLA: Fused TileLang kernels for Linear Attention",
     long_description=open("README.md", encoding="utf8").read(),
     long_description_content_type="text/markdown",
-    packages=find_packages(),
+    packages=find_packages(exclude=["tools", "tools.*"]),
+    package_data={"": ["coefs/*.csv"]},
     license="MIT",
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.8",
-        "tilelang==0.1.9",
-        "apache-tvm-ffi==0.1.9",
+        "tilelang==0.1.12",
     ],
     zip_safe=False,
 )

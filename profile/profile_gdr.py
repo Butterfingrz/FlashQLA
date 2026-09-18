@@ -30,7 +30,8 @@ import pandas as pd
 # Path setup
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(PROJECT_ROOT, "tests"))  # for ref_gdr
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "tests"))    # for ref_gdr
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "profile"))  # for utils
 
 # ---------------------------------------------------------------------------
 # Imports
@@ -42,9 +43,41 @@ from fla.ops.gated_delta_rule.chunk import (
     chunk_gated_delta_rule_bwd as chunk_gated_delta_rule_bwd_fla,
 )
 
-from flash_qla import chunk_gated_delta_rule_fwd as chunk_gated_delta_rule_fwd_qla
-from flash_qla import chunk_gated_delta_rule_bwd as chunk_gated_delta_rule_bwd_qla
-from flash_qla.utils import l2norm, pack, profile
+from flash_qla.ops.gated_delta_rule.chunk import (
+    chunk_gated_delta_rule_fwd as _chunk_gdr_fwd_impl,
+    chunk_gated_delta_rule_bwd as _chunk_gdr_bwd_impl,
+    _auto_intra_cp_context,
+    CHUNK_SIZE,
+)
+from flash_qla.utils import l2norm, pack
+from utils import profile
+
+
+def chunk_gated_delta_rule_fwd_qla(
+    q, k, v, g, beta, scale=None, initial_state=None, cu_seqlens=None,
+    output_final_state=True, output_h=False, auto_cp=True, state_v_first=False,
+    enable_fwd_cp_cache=False, cp_context=None, is_train=True,
+):
+    if cp_context is None:
+        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train)
+    return _chunk_gdr_fwd_impl(
+        q, k, v, g, beta, scale, initial_state, cu_seqlens,
+        output_final_state, output_h, auto_cp, state_v_first,
+        enable_fwd_cp_cache, cp_context, is_train,
+    )
+
+
+def chunk_gated_delta_rule_bwd_qla(
+    q, k, v, g, beta, A, do, dht=None, scale=None, initial_state=None,
+    cu_seqlens=None, state_v_first=False, auto_cp=True, cp_cache=None, cp_context=None,
+    is_train=True,
+):
+    if cp_context is None:
+        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train)
+    return _chunk_gdr_bwd_impl(
+        q, k, v, g, beta, A, do, dht, scale, initial_state,
+        cu_seqlens, state_v_first, auto_cp, cp_cache, cp_context,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +366,22 @@ def profile_gated_delta_rule(
             "[bwd] cp-c": nan,
             "[bwd] cp-dh": nan,
         }
+        # torch ops that FLA launches between fused kernels
+        fla_misc = 0.0
+        for k_name, v_time in prof_fla.items():
+            if k_name == "total":
+                continue
+            if k_name not in result_fla.values() and not any(
+                k_name.startswith(n) for n in [
+                    "chunk_local_cumsum", "chunk_gated_delta_rule_fwd",
+                    "chunk_gated_delta_rule_bwd", "chunk_bwd_kernel",
+                    "kernel_kernel", "prepare_wy_repr", "recompute_w_u",
+                    "compress_heads",
+                ]
+            ):
+                fla_misc += v_time if not math.isnan(v_time) else 0.0
+        if fla_misc > 0:
+            result_fla["[bwd] misc"] = fla_misc
         if num_k_heads < num_v_heads:
             result_fla["[bwd] reduc"] = _get(prof_fla, "compress_heads_kernel")
         result_fla["total"] = prof_fla["total"]
