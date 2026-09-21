@@ -154,8 +154,13 @@ def cp_preprocess_fwd(
     # --- Stage 2: inter correction ---
     if is_inter:
         if is_intra:
+            raw_h0 = initial_state
+            if raw_h0 is not None and not cp_context.is_first_rank:
+                raw_h0 = raw_h0.clone()
+                raw_h0[0] = 0
             h_seq, m_seq = aggregate_card_state(
-                ht, mt, fallback, seq_map_r2c, state_v_first=state_v_first, compute_m=True,
+                ht, mt, fallback, seq_map_r2c, raw_h0=raw_h0,
+                state_v_first=state_v_first, compute_m=True,
             )
         else:
             h_seq, m_seq = ht, mt
@@ -282,10 +287,14 @@ def cp_preprocess_bwd(
     # --- Stage 2: inter correction ---
     if is_inter:
         if is_intra:
+            raw_dht = dht
+            if raw_dht is not None and not cp_context.is_last_rank:
+                raw_dht = raw_dht.clone()
+                raw_dht[-1] = 0
             # aggregate (reverse) -> per-seq dh; m_card is the fwd M product (cached).
             dh_seq, _ = aggregate_card_state(
-                dh, mt, fallback, seq_map_r2c, state_v_first=state_v_first,
-                reverse=True, transpose_m=True, compute_m=False,
+                dh, mt, fallback, seq_map_r2c, raw_h0=raw_dht,
+                state_v_first=state_v_first, reverse=True, transpose_m=True, compute_m=False,
             )
         else:
             dh_seq = dh

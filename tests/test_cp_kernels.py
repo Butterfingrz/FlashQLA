@@ -1,26 +1,5 @@
 # Copyright (c) 2026 The Qwen team, Alibaba Group.
 # Licensed under The MIT License [see LICENSE for details]
-"""L2: the CP support kernels against plain-torch references.
-
-These are the five entry points the CP pre/post-processing is built out of::
-
-    get_warmup_chunks        how far back each cp segment must warm up (one direction)
-    get_warmup_chunks_bidi   the same, both directions, in one launch
-    correct_initial_states   forward scan: per-chunk entering state
-    correct_terminal_states  the same scan, reversed and transposed (backward)
-    aggregate_card_state     the same scan again, keeping only the per-raw-seq result
-                             plus the ordered M product (SM100/SM103 only)
-
-The e2e tests catch *that* CP is wrong; these catch *where*. The references live in
-:mod:`ref_cp`: each is a literal transcription of the kernel's index arithmetic, so a
-changed convention (floor vs ceil, which token of a chunk is sampled, which side M
-multiplies on) fails here with a readable diff instead of showing up as a slightly-off
-gradient three layers up.
-
-Note ``correct_initial_states``, ``correct_terminal_states`` and ``aggregate_card_state``
-are three configurations of one kernel (``tilelang_correct_h0``), so they share one
-reference scan (``ref_cp.ref_scan``) -- the same way they share one kernel body.
-"""
 import os
 import sys
 
@@ -43,21 +22,9 @@ DEVICE = "cuda"
 K = V = 128                # the scan kernels assert this
 SEED = 20260819
 
-# The scan kernels' gemms may run on tensor cores (TF32-class precision), so the
-# comparison is a loose relative-max against a float64 reference. A transposed operand or
-# an off-by-one index is O(1) wrong, which this still catches by orders of magnitude.
 SCAN_RTOL = 2e-2
 
 
-# ===========================================================================
-# Synthetic cp layouts
-#
-# `segments` is the number of cp segments per raw sequence, so [1, 3, 2] means three raw
-# sequences split into 1, 3 and 2 cp segments. Interior segments are chunk-aligned (the
-# intra split only cuts on chunk boundaries); the last segment of a raw sequence may be
-# ragged, which is what makes the floor-vs-ceil difference between the two warmup kernels
-# observable.
-# ===========================================================================
 LAYOUTS = [
     pytest.param([1], id="one-seq-unsplit"),
     pytest.param([2, 2, 2], id="uniform-split"),
@@ -251,9 +218,6 @@ def test_correct_initial_states(
     assert err <= SCAN_RTOL, f"cp_h0 rel_max={err:.2e} > {SCAN_RTOL:g}"
 
     if fallback_pattern == "none":
-        # No fallback folds nothing in: the state entering a segment is a pure shift of the
-        # previous segment's ht (the first is the raw seed) -- a closed form that also guards
-        # ref_scan's own no-fallback branch, which the comparison above cannot.
         seq_map_list = seq_map.tolist()
         for bb in range(len(segments)):
             lo, hi = seq_map_list[bb], seq_map_list[bb + 1]
@@ -305,10 +269,13 @@ def test_correct_terminal_states(
 @pytest.mark.parametrize("segments", LAYOUTS)
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
 @pytest.mark.parametrize("fallback_pattern", FALLBACK_PATTERNS)
+@pytest.mark.parametrize("use_raw_h0", [False, True], ids=["zero-seed", "raw-h0"])
 @pytest.mark.parametrize(
     "reverse, transpose_m", [(False, False), (True, True)], ids=["fwd", "bwd"],
 )
-def test_aggregate_card_state(segments, state_v_first, fallback_pattern, reverse, transpose_m):
+def test_aggregate_card_state(
+    segments, state_v_first, fallback_pattern, use_raw_h0, reverse, transpose_m
+):
     H = 4
     cu, seq_map, _, _ = _build_layout(segments, ragged_tail=False)
     n_cp = cu.shape[0] - 1
@@ -317,13 +284,15 @@ def test_aggregate_card_state(segments, state_v_first, fallback_pattern, reverse
         fallback_pattern=fallback_pattern, seed=SEED + 2,
     )
     ht, mt = ht.bfloat16(), mt.bfloat16()
+    raw_shape = (len(segments), H, V, K) if state_v_first else (len(segments), H, K, V)
+    raw_h0 = torch.randn(raw_shape, device=DEVICE, dtype=torch.float32) if use_raw_h0 else None
 
     h_card, m_card = aggregate_card_state(
-        ht, mt, fallback, seq_map, state_v_first=state_v_first,
+        ht, mt, fallback, seq_map, raw_h0=raw_h0, state_v_first=state_v_first,
         reverse=reverse, transpose_m=transpose_m, compute_m=True,
     )
     _, ref_h, ref_m = ref_scan(
-        ht, mt, fallback, seq_map, state_v_first=state_v_first,
+        ht, mt, fallback, seq_map, raw_h0=raw_h0, state_v_first=state_v_first,
         reverse=reverse, transpose_m=transpose_m,
     )
     err_h = rel_max(h_card, ref_h)
@@ -331,15 +300,8 @@ def test_aggregate_card_state(segments, state_v_first, fallback_pattern, reverse
     err_m = rel_max(m_card, ref_m)
     assert err_m <= SCAN_RTOL, f"m_card rel_max={err_m:.2e} > {SCAN_RTOL:g}"
 
-    # `compute_m=False` is the backward dh aggregate (it reuses the forward m_card): it must
-    # drop M and reproduce the same h_card. `compute_m` selects a separately compiled kernel
-    # (extra shared buffers, different scheduling), but the h recurrence is identical, so the
-    # two agree bit-for-bit in practice; 1e-5 only leaves room for a future scheduling change
-    # to reorder the same arithmetic. It is *not* an accuracy budget -- a real divergence
-    # means one variant is computing the wrong thing (a missing per-iteration barrier once
-    # corrupted the non-fallback path exactly this way). Do not loosen it.
     h_no_m, m_no_m = aggregate_card_state(
-        ht, mt, fallback, seq_map, state_v_first=state_v_first,
+        ht, mt, fallback, seq_map, raw_h0=raw_h0, state_v_first=state_v_first,
         reverse=reverse, transpose_m=transpose_m, compute_m=False,
     )
     assert m_no_m is None

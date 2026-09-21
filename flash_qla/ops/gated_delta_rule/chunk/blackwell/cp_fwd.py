@@ -487,6 +487,7 @@ def tilelang_correct_h0(
         if compute_m:
             @T.prim_func
             def tilelang_correct_h0_kernel(
+                raw_h0: T.Tensor(raw_state_shape, dtype=res_dtype),
                 ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
                 mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
                 fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
@@ -496,11 +497,12 @@ def tilelang_correct_h0(
             ):
                 with T.Kernel(grid, threads=WS_THREADS) as (bbhv,):
                     bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
-                    scan_body(bb, bh, bv, s0, s1, ni, h_card, ht_buffer, mt_buffer,
+                    scan_body(bb, bh, bv, s0, s1, ni, raw_h0, ht_buffer, mt_buffer,
                               fallback_mask, ht_buffer, h_card, m_card)
         else:
             @T.prim_func
             def tilelang_correct_h0_kernel(
+                raw_h0: T.Tensor(raw_state_shape, dtype=res_dtype),
                 ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
                 mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
                 fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
@@ -509,7 +511,7 @@ def tilelang_correct_h0(
             ):
                 with T.Kernel(grid, threads=WS_THREADS) as (bbhv,):
                     bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
-                    scan_body(bb, bh, bv, s0, s1, ni, h_card, ht_buffer, mt_buffer,
+                    scan_body(bb, bh, bv, s0, s1, ni, raw_h0, ht_buffer, mt_buffer,
                               fallback_mask, ht_buffer, h_card, mt_buffer)
 
     elif use_raw_h0:
@@ -687,6 +689,7 @@ def aggregate_card_state(
     mt_buffer: torch.Tensor,   # [cp_batch_size, H, K, K]
     fallback_mask: torch.Tensor,  # [cp_batch_size, H]
     seq_map_r2c: torch.Tensor,  # [raw_batch_size + 1]
+    raw_h0: torch.Tensor | None = None,  # [raw_batch_size, H, K, V] (or [.., V, K])
     state_v_first: bool = False,
     reverse: bool = False,
     transpose_m: bool = False,
@@ -701,6 +704,9 @@ def aggregate_card_state(
     assert k_head_dim == v_head_dim == 128
 
     res_dtype = ht_buffer.dtype
+    use_raw_h0 = raw_h0 is not None
+    if use_raw_h0:
+        raw_h0 = raw_h0.to(res_dtype)
 
     state_kernel = tilelang_correct_h0(
         H=num_heads,
@@ -712,7 +718,7 @@ def aggregate_card_state(
         m_buffer_dtype=mt_buffer.dtype,
         seqlen_dtype=seq_map_r2c.dtype,
         mask_dtype=fallback_mask.dtype,
-        use_raw_h0=False,
+        use_raw_h0=use_raw_h0,
         state_v_first=state_v_first,
         reverse=reverse,
         transpose_m=transpose_m,
@@ -720,21 +726,24 @@ def aggregate_card_state(
         store_inter_h=True,
         compute_m=compute_m,
     )
-    h_card = torch.empty(
+    
+    raw_state_shape = (
         (raw_batch_size, num_heads, v_head_dim, k_head_dim)
         if state_v_first
-        else (raw_batch_size, num_heads, k_head_dim, v_head_dim),
-        dtype=res_dtype,
-        device=ht_buffer.device,
+        else (raw_batch_size, num_heads, k_head_dim, v_head_dim)
     )
+    
+    h_card = torch.empty(raw_state_shape, dtype=res_dtype, device=ht_buffer.device)
+    if not use_raw_h0:
+        raw_h0 = torch.empty(raw_state_shape, dtype=res_dtype, device=ht_buffer.device)
     if compute_m:
         m_card = torch.empty(
             (raw_batch_size, num_heads, k_head_dim, k_head_dim),
             dtype=res_dtype,
             device=mt_buffer.device,
         )
-        state_kernel(ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, h_card, m_card)
+        state_kernel(raw_h0, ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, h_card, m_card)
         return h_card, m_card
 
-    state_kernel(ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, h_card)
+    state_kernel(raw_h0, ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, h_card)
     return h_card, None
