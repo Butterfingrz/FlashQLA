@@ -321,6 +321,7 @@ def tilelang_fused_chunk_gdr_fwd(
                         T.barrier_wait(tcbar_5b, i_s % 2)
                     else:
                         T.barrier_wait(tcbar_5, i_s % 2)
+                    T.tcgen05_after_thread_sync()
 
                     T.barrier_arrive(data_is_free[i_s % 2])
 
@@ -454,6 +455,7 @@ def tilelang_fused_chunk_gdr_fwd(
                     T.copy(p_fragment, p_shared)
                     T.fence_proxy_async()
                     T.barrier_wait(tcbar_2, i_s % 2)
+                    T.tcgen05_after_thread_sync()
                     T.barrier_arrive(bar_3)
 
                     # [STAGE 0] 3
@@ -475,6 +477,7 @@ def tilelang_fused_chunk_gdr_fwd(
                     T.copy(o_tmem, o_fragment)
                     T.sync_threads(102, 128)
                     T.copy(o_fragment, o_shared)
+                    T.fence_proxy_async()
 
                     T.barrier_arrive(data_is_free[i_s % 2])
 

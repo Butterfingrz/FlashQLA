@@ -215,9 +215,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         initial_state: torch.Tensor | None = None,
         output_final_state: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
+        use_qk_l2norm_in_kernel: bool = False,
         state_v_first: bool = False,
         auto_cp: bool = True,
-        use_qk_l2norm_in_kernel: bool = False,
         enable_fwd_cp_cache: bool = True,
         cp_context=None,
         force_intra_cp: bool = False,
@@ -300,9 +300,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             dh0,           # initial_state
             None,          # output_final_state
             None,          # cu_seqlens
+            None,          # use_qk_l2norm_in_kernel
             None,          # state_v_first
             None,          # auto_cp
-            None,          # use_qk_l2norm_in_kernel
             None,          # enable_fwd_cp_cache
             None,          # cp_context
             None,          # force_intra_cp
@@ -457,9 +457,9 @@ def chunk_gated_delta_rule(
         initial_state,
         output_final_state,
         cu_seqlens,
+        use_qk_l2norm_in_kernel,
         state_v_first,
         auto_cp,
-        use_qk_l2norm_in_kernel,
         enable_fwd_cp_cache,
         cp_context,
         force_intra_cp,
