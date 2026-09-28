@@ -213,7 +213,10 @@ def tilelang_prepare_h(
 
             tx = T.get_thread_binding()
 
-            # M in TMEM frees consumer regs to fund producer's 7 gemm descriptors; sum=512, arg2=direction.
+            # Sum must be exactly 512.  Moving M to TMEM freed the 64
+            # regs/thread of M fragment X and Y each carried across iterations,
+            # funding the producer: its MMA warp keeps seven gemm descriptors
+            # live and spilled at 24.  Arg 2 = direction vs the 128-reg bound.
             PRODUCER_NREG = 152
             CONSUMER_S_NREG = 152
             CONSUMER_X_NREG = 104
@@ -358,12 +361,10 @@ def tilelang_prepare_h(
                         # Restage the previous iteration's M_R while Xraw flies.
                         if i_s > 0:
                             T.barrier_wait(tcbar_4b, (i_s + 1) % 2)
-                            T.tcgen05_after_thread_sync()
                             T.copy(m_tmem_R, m_fragment_R)
                             for j_k, j_v in T.Parallel(DK, DK // 2):
                                 m_shared[j_k, j_v + DK // 2] = m_fragment_R[j_k, j_v]
                             T.fence_proxy_async()
-                        T.tcgen05_before_thread_sync()
                         T.barrier_arrive(bar_m)
 
                     T.barrier_wait(tcbar_0, i_s % 2)
@@ -381,7 +382,6 @@ def tilelang_prepare_h(
                         # Z round-trips TMEM -> RF -> SMEM for the M update's B
                         # operand.  X does it all (Y none) while X is idle here.
                         T.barrier_wait(tcbar_3, i_s % 2)
-                        T.tcgen05_after_thread_sync()
                         T.copy(z_tmem, z_fragment)
                         T.sync_threads(103, 128)
                         T.copy(z_fragment, z_shared)
@@ -394,7 +394,6 @@ def tilelang_prepare_h(
                     T.sync_threads(110, 128)
                     g_last_local_X[0] = T.exp2(g_prod_X[0] * 1.442695)
                     T.barrier_wait(tcbar_4b, (num_iters + 1) % 2)
-                    T.tcgen05_after_thread_sync()
                     T.copy(m_tmem_R, m_fragment_R)
                     for j_k, j_v in T.Parallel(DK, DK // 2):
                         m_fragment_R[j_k, j_v] *= g_last_local_X[0]
@@ -444,12 +443,10 @@ def tilelang_prepare_h(
                         # Restage bf16 M_L while U = K @ S is in flight.
                         if i_s > 0:
                             T.barrier_wait(tcbar_4a, (i_s + 1) % 2)
-                            T.tcgen05_after_thread_sync()
                             T.copy(m_tmem_L, m_fragment_L)
                             for j_k, j_v in T.Parallel(DK, DK // 2):
                                 m_shared[j_k, j_v] = m_fragment_L[j_k, j_v]
                             T.fence_proxy_async()
-                        T.tcgen05_before_thread_sync()
                         T.barrier_arrive(bar_m)
 
                     # [STAGE = i_s % num_stages] 1
@@ -474,7 +471,6 @@ def tilelang_prepare_h(
                     T.sync_threads(112, 128)
                     g_last_local_Y[0] = T.exp2(g_prod_Y[0] * 1.442695)
                     T.barrier_wait(tcbar_4a, (num_iters + 1) % 2)
-                    T.tcgen05_after_thread_sync()
                     T.copy(m_tmem_L, m_fragment_L)
                     for j_k, j_v in T.Parallel(DK, DK // 2):
                         m_fragment_L[j_k, j_v] *= g_last_local_Y[0]
@@ -517,7 +513,6 @@ def tilelang_prepare_h(
                         if calc_mt:
                             # Z = K @ M once X/Y restaged bf16 M
                             T.barrier_wait(bar_m, i_s % 2)
-                            T.tcgen05_after_thread_sync()
                             T.tcgen05_gemm(
                                 k_shared[i_s % num_stages, :, :],
                                 m_shared,
@@ -570,7 +565,6 @@ def tilelang_prepare_h(
                         if calc_mt:
                             # M += X^T @ Z once X restaged bf16 Z
                             T.barrier_wait(bar_4, i_s % 2)
-                            T.tcgen05_after_thread_sync()
                             T.tcgen05_gemm(
                                 x_shared,
                                 z_shared[:, :DK // 2],
