@@ -614,14 +614,12 @@ def tilelang_fused_chunk_gdr_bwd(
                     # Pg = s * P * G
                     T.barrier_wait(tcbar_00, (i_s + 0) % 2)
                     T.copy(p_tmem, p_fragment)
-                    for j_s, j_t in T.Parallel(block_S, block_S // 2):
-                        for j_t_vec in T.vectorized(2):
-                            p_fragment[j_s, j_t * 2 + j_t_vec] *= a_fragment[
-                                j_s, j_t * 2 + j_t_vec
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        p_fragment[j_s, j_t] *= a_fragment[
+                                j_s, j_t
                             ]
-                    for j_s, j_t in T.Parallel(block_S, block_S // 2):
-                        for j_t_vec in T.vectorized(2):
-                            p_fragment[j_s, j_t * 2 + j_t_vec] *= scale
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        p_fragment[j_s, j_t] *= scale
                     # S1[1] Pg
                     T.copy(p_fragment, tmp_shared_1_1)
                     T.fence_proxy_async()
@@ -635,11 +633,10 @@ def tilelang_fused_chunk_gdr_bwd(
                     for j_s, j_t in T.Parallel(block_S, block_S):
                         a_fragment[j_s, j_t] *= b_shared[j_t]
                     # Ag = G * Ab
-                    for j_s, j_t in T.Parallel(block_S, block_S // 2):
-                        for j_t_vec in T.vectorized(2):
-                            a_fragment[j_s, j_t * 2 + j_t_vec] *= p_fragment[
-                                j_s, j_t * 2 + j_t_vec
-                            ]
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        a_fragment[j_s, j_t] *= p_fragment[
+                            j_s, j_t
+                        ]
                     T.barrier_arrive(bar_03)
 
                     # 03
@@ -679,11 +676,10 @@ def tilelang_fused_chunk_gdr_bwd(
                     # dAb = G * dAg
                     T.copy(a_tmem, da_fragment)
                     T.copy(mask_tmem, p_fragment)
-                    for j_s, j_t in T.Parallel(block_S, block_S // 2):
-                        for j_t_vec in T.vectorized(2):
-                            da_fragment[j_s, j_t * 2 + j_t_vec] *= p_fragment[
-                                j_s, j_t * 2 + j_t_vec
-                            ]
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        da_fragment[j_s, j_t] *= p_fragment[
+                            j_s, j_t
+                        ]
                     T.copy(da_fragment, da_tmem)
                     T.barrier_wait(tcbar_06, (i_s + 0) % 2)
                     T.barrier_arrive(bar_07)
@@ -693,17 +689,15 @@ def tilelang_fused_chunk_gdr_bwd(
                     # dP = G * dPg
                     T.copy(dp_tmem, dp_fragment)
                     T.copy(mask_tmem, a_fragment)
-                    for j_s, j_t in T.Parallel(block_S, block_S // 2):
-                        for j_t_vec in T.vectorized(2):
-                            dp_fragment[j_s, j_t * 2 + j_t_vec] *= a_fragment[
-                                j_s, j_t * 2 + j_t_vec
-                            ]
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        dp_fragment[j_s, j_t] *= a_fragment[
+                            j_s, j_t
+                        ]
                     # dg += sum((dPg * P) - (dPg * P)^T)
                     T.copy(p_tmem, p_fragment)
-                    for j_s, j_t in T.Parallel(block_S, block_S // 2):
-                        for j_t_vec in T.vectorized(2):
-                            p_fragment[j_s, j_t * 2 + j_t_vec] *= (
-                                dp_fragment[j_s, j_t * 2 + j_t_vec] * scale
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                            p_fragment[j_s, j_t] *= (
+                                dp_fragment[j_s, j_t] * scale
                             )
                     T.copy(p_fragment, mask_tmem)
                     # dPg = s * dPg
@@ -733,11 +727,12 @@ def tilelang_fused_chunk_gdr_bwd(
                     T.copy(dq_tmem, dq_fragment)
                     for j_s, j_k in T.Parallel(block_S, DK):
                         dq_fragment[j_s, j_k] *= g_exp_shared[j_s]
-                    for j_s, j_k in T.Parallel(block_S, DK // 2):
-                        for j_k_vec in T.vectorized(2):
-                            dq_fragment[j_s, j_k * 2 + j_k_vec] *= scale
+                    for j_s, j_k in T.Parallel(block_S, DK):
+                        dq_fragment[j_s, j_k] *= scale
                     T.copy(dq_fragment, dq_tmem)
                     # dg += sum(Q * dQ)
+                    # dQ is persisted in TMEM before this destructive dot.
+                    # Shared Q remains available for the stage-12/14 GEMMs.
                     for j_s, j_k in T.Parallel(block_S, DK):
                         dq_fragment[j_s, j_k] *= tmp_shared_2_1[j_s, j_k]
                     T.reduce_sum(dq_fragment, dg_fragment_2, dim=1, clear=True)
@@ -756,11 +751,10 @@ def tilelang_fused_chunk_gdr_bwd(
                     # dAb * Ar
                     T.copy(a_shared, a_fragment)
                     T.copy(da_tmem, da_fragment)
-                    for j_s, j_t in T.Parallel(block_S, block_S // 2):
-                        for j_t_vec in T.vectorized(2):
-                            a_fragment[j_s, j_t * 2 + j_t_vec] *= da_fragment[
-                                j_s, j_t * 2 + j_t_vec
-                            ]
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        a_fragment[j_s, j_t] *= da_fragment[
+                            j_s, j_t
+                        ]
                     T.copy(a_fragment, a_tmem)
                     # dAb * Ab [ = G * dAg * Ab ]
                     for j_s, j_t in T.Parallel(block_S, block_S):
@@ -772,30 +766,26 @@ def tilelang_fused_chunk_gdr_bwd(
                         x = T.reinterpret(a_fragment[j_s, j_t], dtype="uint32")
                         lo_fragment[j_s, j_t] = x & 0xffff
                         hi_fragment[j_s, j_t] = x >> 16
-                    for j_s, j_t in T.Parallel(block_S, block_S // 2):
-                        for j_t_vec in T.vectorized(2):
-                            tmp_shared_1_2[j_s, j_t * 2 + j_t_vec] = T.reinterpret(
-                                hi_fragment[j_s, j_t * 2 + j_t_vec],
-                                dtype=qkva_dtype,
-                            )
-                    for j_s, j_t in T.Parallel(block_S, block_S // 2):
-                        for j_t_vec in T.vectorized(2):
-                            hi_fragment[j_s, j_t * 2 + j_t_vec] = T.reinterpret(
-                                tmp_shared_1_2[j_t * 2 + j_t_vec, j_s],
-                                dtype="uint16",
-                            )
-                    for j_s, j_t in T.Parallel(block_S, block_S // 2):
-                        for j_t_vec in T.vectorized(2):
-                            tmp_shared_1_2[j_s, j_t * 2 + j_t_vec] = T.reinterpret(
-                                lo_fragment[j_s, j_t * 2 + j_t_vec],
-                                dtype=qkva_dtype,
-                            )
-                    for j_s, j_t in T.Parallel(block_S, block_S // 2):
-                        for j_t_vec in T.vectorized(2):
-                            lo_fragment[j_s, j_t * 2 + j_t_vec] = T.reinterpret(
-                                tmp_shared_1_2[j_t * 2 + j_t_vec, j_s],
-                                dtype="uint16",
-                            )
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        tmp_shared_1_2[j_s, j_t] = T.reinterpret(
+                            hi_fragment[j_s, j_t],
+                            dtype=qkva_dtype,
+                        )
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        hi_fragment[j_s, j_t] = T.reinterpret(
+                            tmp_shared_1_2[j_t, j_s],
+                            dtype="uint16",
+                        )
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        tmp_shared_1_2[j_s, j_t] = T.reinterpret(
+                            lo_fragment[j_s, j_t],
+                            dtype=qkva_dtype,
+                        )
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        lo_fragment[j_s, j_t] = T.reinterpret(
+                            tmp_shared_1_2[j_t, j_s],
+                            dtype="uint16",
+                        )
                     for j_s, j_t in T.Parallel(block_S, block_S):
                         uint32_fragment[j_s, j_t] = (hi_fragment[j_s, j_t] << 16) + \
                             lo_fragment[j_s, j_t]

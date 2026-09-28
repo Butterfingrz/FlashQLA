@@ -19,6 +19,7 @@ from flash_qla import (
     chunk_gated_delta_rule_fwd as qla_fwd,
     chunk_gated_delta_rule_bwd as qla_bwd,
 )
+from flash_qla.ops.gated_delta_rule.chunk import CHUNK_SIZE, build_cp_context
 from flash_qla.utils import l2norm
 
 try:
@@ -103,10 +104,10 @@ FWD_SEQLEN_CONFIGS = [
     SeqLenConfig("1024x8", [1024] * 8),
 ]
 BWD_MODEL_CONFIGS = [
-    ModelConfig("hk16_hv32", h_qk=16, h_v=32),
-    ModelConfig("hk8_hv16", h_qk=8, h_v=16),
-    ModelConfig("hk4_hv8",  h_qk=4, h_v=8),
-    ModelConfig("hk2_hv4",  h_qk=2, h_v=4),
+    ModelConfig("hk32_hv32", h_qk=32, h_v=32),
+    ModelConfig("hk16_hv16", h_qk=16, h_v=16),
+    ModelConfig("hk8_hv8",   h_qk=8,  h_v=8),
+    ModelConfig("hk4_hv4",   h_qk=4,  h_v=4),
 ]
 
 BWD_SEQLEN_CONFIGS = [
@@ -182,7 +183,8 @@ def get_lib_versions() -> Dict[str, str]:
 
 
 def prepare_tensors(
-    seqlens: List[int], h_qk: int, h_v: int, head_dim: int = HEAD_DIM
+    seqlens: List[int], h_qk: int, h_v: int, head_dim: int = HEAD_DIM,
+    swa_ratio: float = 0.75,
 ) -> Optional[Dict[str, Any]]:
     device = "cuda"
     num_seqs = len(seqlens)
@@ -232,7 +234,6 @@ def prepare_tensors(
             return None
         raise e
 
-    swa_ratio = 0.75
     swa_mask = torch.zeros(h_v, dtype=torch.bool, device=device)
     swa_mask[: math.ceil(swa_ratio * h_v)] = True
     swa_mask = swa_mask[torch.randperm(h_v, device=device)]
@@ -264,13 +265,14 @@ def bench_fwd(
     repeats: int = 5,
     auto_cp: bool = True,
     backend: str = "event",
+    swa_ratio: float = 0.75,
 ) -> Tuple[float, float, float]:
     """
     Run Forward Pass Benchmark.
     Returns: (qla_mean_ms, fi_mean_ms, fla_mean_ms)
     """
     cleanup_cuda()
-    data = prepare_tensors(seqlens, h_qk, h_v, head_dim)
+    data = prepare_tensors(seqlens, h_qk, h_v, head_dim, swa_ratio=swa_ratio)
     if data is None:
         return float("nan"), float("nan"), float("nan")
 
@@ -278,6 +280,10 @@ def bench_fwd(
     h0, scale, cu_seqlens = data["h0"], data["scale"], data["cu_seqlens"]
 
     results = {}
+    cp_context = build_cp_context(
+        cu_seqlens, enable_intra=auto_cp, num_v_heads=h_v,
+        chunk_size=CHUNK_SIZE, is_train=False,
+    )
 
     def call_qla_fwd():
         qla_fwd(
@@ -291,7 +297,7 @@ def bench_fwd(
             output_final_state=True,
             output_h=False,
             cu_seqlens=cu_seqlens,
-            auto_cp=auto_cp,
+            cp_context=cp_context,
         )
 
     try:
@@ -372,6 +378,7 @@ def bench_bwd(
     repeats: int = 100,
     auto_cp: bool = True,
     backend: str = "event",
+    swa_ratio: float = 0.75,
 ) -> Tuple[float, float]:
     """
     Run Backward Pass Benchmark.
@@ -379,7 +386,7 @@ def bench_bwd(
     """
     cleanup_cuda()
 
-    data = prepare_tensors(seqlens, h_qk, h_v, head_dim)
+    data = prepare_tensors(seqlens, h_qk, h_v, head_dim, swa_ratio=swa_ratio)
     if data is None:
         return float("nan"), float("nan")
 
@@ -389,8 +396,12 @@ def bench_bwd(
 
     g_cumsum = None
     A = None
+    cp_cache = None
 
-    # Pre-run FWD to get intermediates
+    cp_context = build_cp_context(
+        cu_seqlens, enable_intra=auto_cp, num_v_heads=h_v,
+        chunk_size=CHUNK_SIZE, is_train=True,
+    )
     try:
         result = qla_fwd(
             q,
@@ -403,10 +414,12 @@ def bench_bwd(
             output_final_state=True,
             output_h=False,
             cu_seqlens=cu_seqlens,
-            auto_cp=auto_cp,
+            cp_context=cp_context,
+            enable_fwd_cp_cache=True,
         )
         if isinstance(result, tuple) and len(result) >= 2:
             g_cumsum, A = result[0], result[1]
+            cp_cache = result[5] if len(result) > 5 else None
         else:
             raise RuntimeError("FlashQLA FWD did not return expected intermediates")
     except RuntimeError as e:
@@ -429,7 +442,8 @@ def bench_bwd(
             scale=scale,
             initial_state=h0,
             cu_seqlens=cu_seqlens,
-            auto_cp=auto_cp,
+            cp_context=cp_context,
+            cp_cache=cp_cache,
         )
 
     try:
@@ -489,6 +503,10 @@ def main():
     parser.add_argument("--skip-fi", action="store_true")
     parser.add_argument("--skip-fla", action="store_true")
     parser.add_argument("--no-cp", action="store_true", help="Disable chunk parallel")
+    parser.add_argument("--swa-ratio", type=float, default=0.75,
+                        help="Fraction of v heads with a decaying g; the rest get g=0 "
+                             "(full-history). 0 = every head full-history, which is the "
+                             "regime the autocp latency model is calibrated in")
     parser.add_argument("--backend", choices=["event", "cudagraph"], default="cudagraph",
                         help="Profiler backend: event (per-iter CUDA events) or cudagraph (graph replay, eliminates host dispatch overhead)")
     args = parser.parse_args()
@@ -537,6 +555,7 @@ def main():
                         repeats=args.repeats,
                         auto_cp=not args.no_cp,
                         backend=args.backend,
+                        swa_ratio=args.swa_ratio,
                     )
 
                     if math.isnan(qla_ms) and math.isnan(fla_ms):
@@ -584,6 +603,7 @@ def main():
                         repeats=args.repeats,
                         auto_cp=not args.no_cp,
                         backend=args.backend,
+                        swa_ratio=args.swa_ratio,
                     )
 
                     if math.isnan(qla_bwd_ms) and math.isnan(fla_bwd_ms):

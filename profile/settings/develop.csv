@@ -1,4 +1,7 @@
-batch_size,num_tokens,varlen,num_k_heads,num_v_heads
-1,32768,False,4,4
-1,32768,False,8,8
-1,32768,False,16,16
+batch_size,num_tokens,varlen,num_k_heads,num_v_heads,swa_ratio
+1,32768,False,16,16,0
+1,32768,False,16,16,0.2
+1,32768,False,16,16,0.4
+1,32768,False,16,16,0.6
+1,32768,False,16,16,0.8
+1,32768,False,16,16,1.0
